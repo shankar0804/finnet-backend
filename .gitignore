@@ -1,0 +1,30 @@
+# Python
+venv/
+.venv/
+win-venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node
+node_modules/
+
+# WhatsApp session
+whatsapp-bot/auth_info/
+
+# Secrets (set these via Render environment variables instead)
+# service_account.json
+# client_secrets.json
+
+# Logs
+*.log
+server.log
+
+# IDE
+.vscode/
+.idea/
+*.sw?
+
+# OS
+.DS_Store
+Thumbs.db

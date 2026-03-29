@@ -1,0 +1,13 @@
+venv/
+.venv/
+win-venv/
+__pycache__/
+*.pyc
+whatsapp-bot/node_modules/
+whatsapp-bot/auth_info/
+.git/
+.gitignore
+deploy/
+*.log
+server.log
+test_*.py
