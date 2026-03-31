@@ -21,12 +21,38 @@ const {
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const qrcode = require('qrcode-terminal');
+const qrcodeLib = require('qrcode');
 const FormData = require('form-data');
 const http = require('http');
 const { BOT_NAME, TRAKR_API_URL, MAX_ROWS_IN_REPLY, MAX_MESSAGE_LENGTH, AUTH_DIR } = require('./config');
 const { classifyIntent } = require('./agent');
 
 const logger = pino({ level: 'warn' });
+
+// ─── Internal Status Server (port 3001) ───
+// Flask proxy hits this to report status/QR to the frontend UI
+let botState = { state: 'offline', qr: null, qrBase64: null, phone: null };
+
+const STATUS_PORT = process.env.BOT_STATUS_PORT || 3001;
+const statusServer = http.createServer(async (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (req.url === '/status' || req.url === '/') {
+        res.writeHead(200);
+        res.end(JSON.stringify(botState));
+    } else if (req.url === '/qr') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ qr: botState.qr, qrBase64: botState.qrBase64, state: botState.state }));
+    } else {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'Not found' }));
+    }
+});
+
+statusServer.listen(STATUS_PORT, '127.0.0.1', () => {
+    console.log(`📡 Bot status server running on http://127.0.0.1:${STATUS_PORT}`);
+});
 
 // ─── Personality ───
 const REACTIONS = {
@@ -315,20 +341,31 @@ async function startBot() {
         generateHighQualityLinkPreview: false,
     });
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         if (qr) {
             console.log('\n📱 Scan this QR code with WhatsApp:\n');
             qrcode.generate(qr, { small: true });
             console.log('\nWaiting for scan...\n');
+
+            // Generate base64 QR image for the web UI
+            try {
+                const qrBase64 = await qrcodeLib.toDataURL(qr, { width: 280, margin: 2 });
+                botState = { state: 'qr', qr, qrBase64, phone: null };
+            } catch (e) {
+                console.error('QR base64 generation failed:', e.message);
+                botState = { state: 'qr', qr, qrBase64: null, phone: null };
+            }
         }
         if (connection === 'close') {
             const code = lastDisconnect?.error?.output?.statusCode;
             const retry = code !== DisconnectReason.loggedOut;
             console.log(`❌ Closed (${code}). ${retry ? 'Reconnecting...' : 'Logged out. Clearing session...'}`);
             if (retry) {
+                botState = { state: 'reconnecting', qr: null, qrBase64: null, phone: null };
                 startBot();
             } else {
+                botState = { state: 'logged_out', qr: null, qrBase64: null, phone: null };
                 // If logged out (401) due to corrupted session on stop, delete auth and restart fresh
                 const fs = require('fs');
                 if (fs.existsSync(AUTH_DIR)) {
@@ -339,6 +376,8 @@ async function startBot() {
             }
         }
         if (connection === 'open') {
+            const phoneNumber = sock.user?.id?.split(':')[0] || sock.user?.id?.split('@')[0] || null;
+            botState = { state: 'connected', qr: null, qrBase64: null, phone: phoneNumber };
             console.log('✅ WhatsApp connected! Bot is live.');
             console.log(`🤖 Listening for @${BOT_NAME} in groups...\n`);
         }
