@@ -19,4 +19,8 @@ module.exports = {
 
     // Path to store WhatsApp session credentials (for auto-reconnect)
     AUTH_DIR: './auth_info',
+
+    // NVIDIA AI settings for intent classification
+    NVIDIA_API_URL: process.env.NVIDIA_API_URL || 'https://integrate.api.nvidia.com/v1',
+    NVIDIA_KEY: (process.env.NVIDIA_KEY || '').trim()
 };
