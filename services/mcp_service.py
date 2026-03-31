@@ -11,7 +11,7 @@ import os
 _cache = {"data": None, "timestamp": 0}
 CACHE_TTL = 60  # seconds
 
-NVIDIA_KEY = os.environ.get("NVIDIA_KEY", "")
+NVIDIA_KEY = os.environ.get("NVIDIA_KEY", "").strip()
 
 # Schema definition - single source of truth
 SCHEMA = {
