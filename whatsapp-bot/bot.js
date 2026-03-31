@@ -24,8 +24,10 @@ const qrcode = require('qrcode-terminal');
 const qrcodeLib = require('qrcode');
 const FormData = require('form-data');
 const http = require('http');
-const { BOT_NAME, TRAKR_API_URL, MAX_ROWS_IN_REPLY, MAX_MESSAGE_LENGTH, AUTH_DIR } = require('./config');
+const { createClient } = require('@supabase/supabase-js');
+const { BOT_NAME, TRAKR_API_URL, MAX_ROWS_IN_REPLY, MAX_MESSAGE_LENGTH, AUTH_DIR, SUPABASE_URL, SUPABASE_KEY } = require('./config');
 const { classifyIntent } = require('./agent');
+const useSupabaseAuthState = require('./supabaseAuth');
 
 const logger = pino({ level: 'warn' });
 
@@ -50,8 +52,8 @@ const statusServer = http.createServer(async (req, res) => {
     }
 });
 
-statusServer.listen(STATUS_PORT, '127.0.0.1', () => {
-    console.log(`📡 Bot status server running on http://127.0.0.1:${STATUS_PORT}`);
+statusServer.listen(STATUS_PORT, '0.0.0.0', () => {
+    console.log(`📡 Bot status server running on http://0.0.0.0:${STATUS_PORT}`);
 });
 
 // ─── Personality ───
@@ -327,7 +329,14 @@ async function queryTrakr(query) {
 // ─── Bot Core ───
 
 async function startBot() {
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    // 1. Initialize Supabase
+    if (!SUPABASE_URL || !SUPABASE_KEY) {
+        throw new Error("Missing SUPABASE_URL or SUPABASE_KEY in environment/config.");
+    }
+    const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+    // 2. Fetch or create Auth State from the database
+    const { state, saveCreds } = await useSupabaseAuthState(supabase, 'wa_');
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -366,12 +375,13 @@ async function startBot() {
                 startBot();
             } else {
                 botState = { state: 'logged_out', qr: null, qrBase64: null, phone: null };
-                // If logged out (401) due to corrupted session on stop, delete auth and restart fresh
-                const fs = require('fs');
-                if (fs.existsSync(AUTH_DIR)) {
-                    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                // If logged out (401), delete DB session entries and restart fresh
+                console.log('🔄 Session cleared from DB. Restarting bot for new QR scan...');
+                try {
+                    await supabase.from('whatsapp_auth').delete().like('file_name', 'wa_%');
+                } catch (e) {
+                    console.error('Failed to clear DB auth session', e);
                 }
-                console.log('🔄 Session cleared. Restarting bot for new QR scan...');
                 startBot();
             }
         }

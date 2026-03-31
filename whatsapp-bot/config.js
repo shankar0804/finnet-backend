@@ -22,5 +22,9 @@ module.exports = {
 
     // NVIDIA AI settings for intent classification
     NVIDIA_API_URL: process.env.NVIDIA_API_URL || 'https://integrate.api.nvidia.com/v1',
-    NVIDIA_KEY: (process.env.NVIDIA_KEY || '').trim()
+    NVIDIA_KEY: (process.env.NVIDIA_KEY || '').trim(),
+
+    // Supabase credentials for persistent WhatsApp session auth
+    SUPABASE_URL: process.env.SUPABASE_URL || '',
+    SUPABASE_KEY: process.env.SUPABASE_KEY || ''
 };
