@@ -25,6 +25,6 @@ module.exports = {
     NVIDIA_KEY: (process.env.NVIDIA_KEY || '').trim(),
 
     // Supabase credentials for persistent WhatsApp session auth
-    SUPABASE_URL: process.env.SUPABASE_URL || '',
-    SUPABASE_KEY: process.env.SUPABASE_KEY || ''
+    SUPABASE_URL: process.env.SUPABASE_URL || 'https://vljfczytysvhochiirlf.supabase.co',
+    SUPABASE_KEY: process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_KEY || ''
 };
