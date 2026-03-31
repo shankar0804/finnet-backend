@@ -1,10 +1,17 @@
 import json
+import time
 import sqlite3
 import pandas as pd
 from openai import OpenAI
 from database.db import supabase
 
-NVIDIA_KEY = "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"
+import os
+
+# ── Data cache to avoid fetching from Supabase on every query ──
+_cache = {"data": None, "timestamp": 0}
+CACHE_TTL = 60  # seconds
+
+NVIDIA_KEY = os.environ.get("NVIDIA_KEY", "")
 
 # Schema definition - single source of truth
 SCHEMA = {
@@ -150,12 +157,17 @@ User: "Show everyone"
 {{"columns": ["*"], "filters": [], "limit": 50}}"""
 
 
-async def execute_mcp_query(user_query: str) -> dict:
+async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict:
     """Structured JSON approach: LLM outputs a filter spec, Python builds SQL deterministically."""
     try:
-        # 1. Fetch data into local SQLite cache
-        response = supabase.table("influencers").select("*").execute()
-        db_records = response.data
+        # 1. Fetch data (with 60s cache to avoid repeated Supabase round-trips)
+        now = time.time()
+        if _cache["data"] is None or (now - _cache["timestamp"]) > CACHE_TTL:
+            response = supabase.table("influencers").select("*").execute()
+            _cache["data"] = response.data
+            _cache["timestamp"] = now
+        
+        db_records = _cache["data"]
         if not db_records:
             return {"type": "data", "data": [], "insight": "The database is currently empty."}
 
@@ -172,7 +184,8 @@ async def execute_mcp_query(user_query: str) -> dict:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_query}
             ],
-            temperature=0.0
+            temperature=0.0,
+            max_tokens=256
         )
 
         raw_output = llm_response.choices[0].message.content.strip()
@@ -196,18 +209,21 @@ async def execute_mcp_query(user_query: str) -> dict:
         except sqlite3.Error as sql_err:
             return {"type": "error", "message": f"Query error: {sql_err}", "sql": sql}
 
-        # 6. Generate insight
-        insight_prompt = [
-            {"role": "system", "content": "You are a data analyst. Write 1-2 sentences summarizing the query results. Use <strong> for emphasis. No code blocks, no markdown, just plain text with HTML bold tags."},
-            {"role": "user", "content": f"Question: {user_query}\nResults ({len(result_df)} rows): {result_df.head(10).to_json(orient='records')}"}
-        ]
+        # 6. Generate insight (skip for WhatsApp bot — it formats its own reply)
+        insight_text = f"Found {len(result_df)} result(s)."
+        if not skip_insight:
+            insight_prompt = [
+                {"role": "system", "content": "You are a data analyst. Write 1-2 sentences summarizing the query results. Use <strong> for emphasis. No code blocks, no markdown, just plain text with HTML bold tags."},
+                {"role": "user", "content": f"Question: {user_query}\nResults ({len(result_df)} rows): {result_df.head(10).to_json(orient='records')}"}
+            ]
 
-        insight_response = client_llm.chat.completions.create(
-            model="meta/llama-3.1-8b-instruct",
-            messages=insight_prompt,
-            temperature=0.3
-        )
-        insight_text = insight_response.choices[0].message.content.strip()
+            insight_response = client_llm.chat.completions.create(
+                model="meta/llama-3.1-8b-instruct",
+                messages=insight_prompt,
+                temperature=0.3,
+                max_tokens=128
+            )
+            insight_text = insight_response.choices[0].message.content.strip()
 
         return {
             "type": "data",

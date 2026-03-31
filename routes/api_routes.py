@@ -14,12 +14,13 @@ def custom_search():
     try:
         data = request.get_json(silent=True) or {}
         query = data.get('query', '')
+        skip_insight = data.get('skip_insight', False)
         if not query: return jsonify({"error": "Empty Query"}), 400
         
         import asyncio
         from services.mcp_service import execute_mcp_query
         
-        answer = asyncio.run(execute_mcp_query(query))
+        answer = asyncio.run(execute_mcp_query(query, skip_insight=skip_insight))
         return jsonify({"answer": answer})
     except Exception as e:
         logger.error(f"API /custom-search Error: {e}")
@@ -184,3 +185,35 @@ def export_to_sheet():
     except Exception as e:
         logger.error(f"API /export-to-sheet Error: {traceback.format_exc()}")
         return jsonify({"error": "Export failed", "details": str(e)}), 500
+
+@api_bp.route('/update-field', methods=['POST'])
+def update_field():
+    """Allows updating a specific database column for a creator from the LLM agent."""
+    try:
+        data = request.get_json(silent=True) or {}
+        username = data.get('username')
+        field = data.get('field')
+        value = data.get('value')
+        
+        if not username or not field:
+            return jsonify({"error": "Missing username or field"}), 400
+            
+        from services.mcp_service import VALID_COLUMNS
+        if field not in VALID_COLUMNS:
+            return jsonify({"error": f"Invalid field '{field}'. Valid fields are: {', '.join(VALID_COLUMNS)}"}), 400
+            
+        # Execute update
+        update_data = {field: value}
+        response = supabase.table("influencers").update(update_data).eq("username", username).execute()
+        
+        if len(response.data) == 0:
+             return jsonify({"error": f"Creator @{username} not found in database"}), 404
+             
+        return jsonify({
+            "success": True, 
+            "message": f"Updated `{field}` to `{value}` for @{username}",
+            "data": response.data[0]
+        })
+    except Exception as e:
+        logger.error(f"API /update-field Error: {traceback.format_exc()}")
+        return jsonify({"error": "Update failed", "details": str(e)}), 500

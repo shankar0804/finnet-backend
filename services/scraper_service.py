@@ -49,6 +49,13 @@ def fetch_influencer_data(username: str) -> dict:
         raise ValueError("No profile data found for this user.")
         
     profile_data = items[0]
+    
+    # Guard: Apify sometimes returns profile shell with no actual data
+    if profile_data.get("followersCount") is None and profile_data.get("postsCount") is None:
+        raise ValueError(
+            f"Instagram returned an empty profile for @{username}. "
+            "This usually means Instagram blocked the scrape. Please try again in a minute."
+        )
         
     # Isolate reels: filter to videos/clips, exclude pinned
     latest_posts = profile_data.get("latestPosts", [])
