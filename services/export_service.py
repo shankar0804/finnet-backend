@@ -20,52 +20,57 @@ IMPERSONATE_USER = 'operations@finnetmedia.com'
 def _get_services():
     """Returns authenticated Sheets and Drive service objects, impersonating a real user.
     
-    Loads credentials from GOOGLE_SA_BASE64 env var (production) or
-    service_account.json file (local dev).
+    Priority: GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON) > GOOGLE_SA_BASE64 > file.
     """
+    sa_json_raw = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip()
     sa_b64 = os.environ.get('GOOGLE_SA_BASE64', '').strip()
     
-    if sa_b64:
-        # Production: decode base64 env var → JSON dict → credentials
-        # Try base64 first, fall back to raw JSON
+    sa_info = None
+    
+    # Option 1: Raw JSON env var (simplest, most reliable)
+    if sa_json_raw:
+        # Strip surrounding quotes if present
+        if sa_json_raw.startswith('"') and sa_json_raw.endswith('"'):
+            sa_json_raw = sa_json_raw[1:-1]
+        if sa_json_raw.startswith("'") and sa_json_raw.endswith("'"):
+            sa_json_raw = sa_json_raw[1:-1]
+        
+        sa_info = json.loads(sa_json_raw)
+        logger.info("Using GOOGLE_SERVICE_ACCOUNT_JSON env var")
+    
+    # Option 2: Base64-encoded JSON env var
+    elif sa_b64:
         try:
             decoded = base64.b64decode(sa_b64).decode('utf-8')
         except Exception:
-            # Maybe it's raw JSON, not base64-encoded
             decoded = sa_b64
-        
         sa_info = json.loads(decoded)
-        
-        # Fix private key: env vars often store literal '\n' instead of real newlines
-        if 'private_key' in sa_info:
-            pk = sa_info['private_key']
-            # Replace literal two-char sequence '\\n' with actual newline
-            if '\\n' in pk and '\n' not in pk:
-                sa_info['private_key'] = pk.replace('\\n', '\n')
-            # Also handle case where it has a mix  
-            elif '\\n' in pk:
-                sa_info['private_key'] = pk.replace('\\n', '\n')
-            
-            # Diagnostic logging (safe — no key content revealed)
-            has_header = sa_info['private_key'].startswith('-----BEGIN')
-            has_newlines = '\n' in sa_info['private_key']
-            logger.info(f"Private key check: has_pem_header={has_header}, has_newlines={has_newlines}, length={len(sa_info['private_key'])}")
-        
-        creds = service_account.Credentials.from_service_account_info(
-            sa_info, scopes=SCOPES
-        )
-        logger.info("Loaded Google SA credentials from GOOGLE_SA_BASE64 env var")
+        logger.info("Using GOOGLE_SA_BASE64 env var")
+    
+    # Option 3: Local file
     elif os.path.exists(SERVICE_ACCOUNT_FILE):
-        # Local dev: load from file
         creds = service_account.Credentials.from_service_account_file(
             SERVICE_ACCOUNT_FILE, scopes=SCOPES
         )
         logger.info("Loaded Google SA credentials from service_account.json file")
+        creds = creds.with_subject(IMPERSONATE_USER)
+        sheets = build('sheets', 'v4', credentials=creds)
+        drive = build('drive', 'v3', credentials=creds)
+        return sheets, drive
     else:
         raise FileNotFoundError(
             "No Google service account credentials found. "
-            "Set GOOGLE_SA_BASE64 env var or provide service_account.json"
+            "Set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SA_BASE64 env var, or provide service_account.json"
         )
+    
+    # Fix private key newlines — env vars store literal '\\n' instead of real newlines
+    if sa_info and 'private_key' in sa_info:
+        sa_info['private_key'] = sa_info['private_key'].replace('\\n', '\n')
+        logger.info(f"Private key: starts_with_BEGIN={sa_info['private_key'][:27]=='-----BEGIN PRIVATE KEY-----'}, length={len(sa_info['private_key'])}")
+    
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info, scopes=SCOPES
+    )
     
     # Impersonate the Workspace user so we use THEIR Drive storage
     creds = creds.with_subject(IMPERSONATE_USER)
