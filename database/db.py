@@ -10,8 +10,8 @@ def new_init(self, *args, **kwargs):
 httpx.Client.__init__ = new_init
 # -------------------------------
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://vljfczytysvhochiirlf.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "YOUR_SUPABASE_KEY_HERE")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
 # Initialize global Supabase Client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)

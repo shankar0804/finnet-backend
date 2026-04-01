@@ -8,8 +8,8 @@ from PIL import Image
 from openai import OpenAI
 
 PADDLE_URL = "https://ai.api.nvidia.com/v1/cv/baidu/paddleocr"
-PADDLE_KEY = "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"
-QWEN_KEY = "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"
+PADDLE_KEY = os.environ.get("PADDLE_KEY", "")
+QWEN_KEY = os.environ.get("QWEN_KEY", "")
 
 def run_ocr_pipeline(image_bytes: bytes) -> dict:
     """Executes the dual-node AI pipeline to extract analytical values from raw dashboard screenshots."""

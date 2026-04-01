@@ -24,10 +24,18 @@ const qrcode = require('qrcode-terminal');
 const qrcodeLib = require('qrcode');
 const FormData = require('form-data');
 const http = require('http');
-const { createClient } = require('@supabase/supabase-js');
-const { BOT_NAME, TRAKR_API_URL, MAX_ROWS_IN_REPLY, MAX_MESSAGE_LENGTH, AUTH_DIR, SUPABASE_URL, SUPABASE_KEY } = require('./config');
+const { BOT_NAME, TRAKR_API_URL, MAX_ROWS_IN_REPLY, MAX_MESSAGE_LENGTH, AUTH_DIR, SUPABASE_URL, SUPABASE_KEY, USE_SUPABASE_AUTH } = require('./config');
 const { classifyIntent } = require('./agent');
-const useSupabaseAuthState = require('./supabaseAuth');
+
+// Supabase auth (only loaded when SUPABASE_URL is configured)
+let createClient, useSupabaseAuthState;
+if (USE_SUPABASE_AUTH && SUPABASE_URL && SUPABASE_KEY) {
+    createClient = require('@supabase/supabase-js').createClient;
+    useSupabaseAuthState = require('./supabaseAuth');
+    console.log('🔐 Auth mode: Supabase (persistent)');
+} else {
+    console.log('🔐 Auth mode: Local file system');
+}
 
 const logger = pino({ level: 'warn' });
 
@@ -52,8 +60,16 @@ const statusServer = http.createServer(async (req, res) => {
     }
 });
 
-statusServer.listen(STATUS_PORT, '0.0.0.0', () => {
-    console.log(`📡 Bot status server running on http://0.0.0.0:${STATUS_PORT}`);
+const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
+statusServer.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.log(`⚠️ Port ${STATUS_PORT} in use — status server skipped (bot still works)`);
+    } else {
+        console.error('Status server error:', err);
+    }
+});
+statusServer.listen(STATUS_PORT, BIND_HOST, () => {
+    console.log(`📡 Bot status server running on http://${BIND_HOST}:${STATUS_PORT}`);
 });
 
 // ─── Personality ───
@@ -101,63 +117,81 @@ const QUIPS = {
 };
 function quip(key) { return randomFrom(QUIPS[key]); }
 
-// Store recent messages per group (last 50)
-const groupHistory = new Map();
+// Store recent messages per chat (last 50) — works for both groups and DMs
+const chatHistory = new Map();
 const MAX_HISTORY = 50;
 
-function addToHistory(groupJid, msg) {
-    if (!groupHistory.has(groupJid)) groupHistory.set(groupJid, []);
-    const history = groupHistory.get(groupJid);
+function addToHistory(jid, msg) {
+    if (!chatHistory.has(jid)) chatHistory.set(jid, []);
+    const history = chatHistory.get(jid);
     history.push(msg);
     if (history.length > MAX_HISTORY) history.shift();
 }
 
+// ─── Pending Scrape State Machine ───
+// Tracks per-chat scrape flows that need mandatory field input
+const pendingScrapes = new Map();
+// Key: jid, Value: { queue: [{username, scraped}], current: {username, step, data}, sock }
+
 /**
- * Extract Instagram username from text (URL or plain username).
+ * Extract first Instagram username from text.
  */
 function extractInstagramUsername(text) {
     if (!text) return null;
-    // Match instagram.com/username (handles /reel/, /p/, etc. paths too)
     const urlMatch = text.match(/instagram\.com\/(?:reel\/|p\/)?([A-Za-z0-9_.]+)/i);
     if (urlMatch) return urlMatch[1].split('?')[0].split('/')[0];
     return null;
 }
 
 /**
- * Scan recent group messages for Instagram links and images.
+ * Extract ALL Instagram usernames from text (for bulk link dumps).
  */
-function findContextFromHistory(groupJid) {
-    const history = groupHistory.get(groupJid) || [];
-    const images = [];
-    let instagramUsername = null;
+function extractAllInstagramUsernames(text) {
+    if (!text) return [];
+    const matches = text.matchAll(/instagram\.com\/(?:reel\/|p\/)?([A-Za-z0-9_.]+)/gi);
+    const usernames = [];
+    for (const m of matches) {
+        const u = m[1].split('?')[0].split('/')[0];
+        if (u && !usernames.includes(u)) usernames.push(u);
+    }
+    return usernames;
+}
 
-    // Scan recent messages (newest first)
+/**
+ * Find screenshots from recent chat history.
+ * Only looks back 3 messages from latest to avoid picking up old screenshots.
+ */
+function findRecentScreenshots(jid) {
+    const history = chatHistory.get(jid) || [];
+    const images = [];
+    // Look at last 3 messages only (not the current message)
+    const start = Math.max(0, history.length - 4);
+    for (let i = history.length - 2; i >= start; i--) {
+        if (history[i]?.message?.imageMessage) {
+            images.unshift(history[i]);
+        }
+    }
+    return images;
+}
+
+/**
+ * Find first IG username from recent history.
+ */
+function findUsernameFromHistory(jid) {
+    const history = chatHistory.get(jid) || [];
     for (let i = history.length - 1; i >= 0; i--) {
         const msg = history[i];
         const text = msg.message?.conversation
             || msg.message?.extendedTextMessage?.text
             || msg.message?.imageMessage?.caption
-            || msg.message?.videoMessage?.caption
             || '';
-
-        // Look for Instagram link
-        if (!instagramUsername && text) {
+        if (text) {
             const username = extractInstagramUsername(text);
-            if (username) instagramUsername = username;
+            if (username) return username;
         }
-
-        // Look for images
-        if (msg.message?.imageMessage) {
-            images.unshift(msg);
-        }
-
-        // Don't look back more than 25 messages
-        if ((history.length - 1 - i) > 25) break;
-        // Cap at 10 images
-        if (images.length >= 10) break;
+        if ((history.length - 1 - i) > 10) break;
     }
-
-    return { images, instagramUsername };
+    return null;
 }
 
 /**
@@ -183,41 +217,56 @@ async function callScraper(username) {
  */
 async function processImage(msg, targetUsername) {
     try {
+        console.log(`📸 [OCR] Downloading image for @${targetUsername}...`);
         const buffer = await downloadMediaMessage(msg, 'buffer', {});
         if (!buffer || buffer.length === 0) {
-            return { success: false, error: 'Failed to download image' };
+            console.error(`📸 [OCR] Download failed: empty buffer`);
+            return { success: false, error: 'Failed to download image (empty buffer)' };
         }
+        console.log(`📸 [OCR] Downloaded ${(buffer.length / 1024).toFixed(1)}KB, sending to OCR...`);
 
         const form = new FormData();
         form.append('image', buffer, {
             filename: 'screenshot.jpg',
-            contentType: msg.message.imageMessage.mimetype || 'image/jpeg',
+            contentType: msg.message?.imageMessage?.mimetype || 'image/jpeg',
         });
         form.append('target_username', targetUsername);
 
         return new Promise((resolve) => {
-            form.submit(`${TRAKR_API_URL}/api/upload`, (err, res) => {
+            const req = form.submit(`${TRAKR_API_URL}/api/upload`, (err, res) => {
                 if (err) {
-                    resolve({ success: false, error: err.message });
+                    console.error(`📸 [OCR] Upload error: ${err.message}`);
+                    resolve({ success: false, error: `Upload failed: ${err.message}` });
                     return;
                 }
                 let body = '';
                 res.on('data', (chunk) => body += chunk);
                 res.on('end', () => {
+                    console.log(`📸 [OCR] Server responded: ${res.statusCode} (${body.length} bytes)`);
                     try {
                         const data = JSON.parse(body);
                         if (res.statusCode >= 200 && res.statusCode < 300) {
                             resolve({ success: true, result: data.result });
                         } else {
-                            resolve({ success: false, error: data.error || 'OCR failed' });
+                            resolve({ success: false, error: data.error || `OCR failed (HTTP ${res.statusCode})` });
                         }
                     } catch (e) {
+                        console.error(`📸 [OCR] Invalid server response: ${body.slice(0, 200)}`);
                         resolve({ success: false, error: 'Invalid server response' });
                     }
                 });
+                res.on('error', (e) => {
+                    console.error(`📸 [OCR] Response error: ${e.message}`);
+                    resolve({ success: false, error: `Response error: ${e.message}` });
+                });
+            });
+            req.on('error', (e) => {
+                console.error(`📸 [OCR] Request error: ${e.message}`);
+                resolve({ success: false, error: `Request failed: ${e.message}` });
             });
         });
     } catch (err) {
+        console.error(`📸 [OCR] Exception: ${err.message}`);
         return { success: false, error: err.message };
     }
 }
@@ -268,6 +317,17 @@ async function exportToSheet(searchQuery) {
 
 // ─── AI Search Formatting ───
 
+// Default columns to show in search results
+const DEFAULT_DISPLAY_COLS = ['username', 'niche', 'followers', 'avg_views'];
+
+function formatNumber(n) {
+    if (isNaN(n) || n === null || n === undefined || n === '') return '-';
+    n = parseInt(n);
+    if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+    return `${n}`;
+}
+
 function formatReply(data) {
     if (!data || data.type === 'error') {
         return `❌ *Error:* ${data?.message || 'Something went wrong.'}`;
@@ -281,34 +341,26 @@ function formatReply(data) {
     }
 
     if (data.data && data.data.length > 0) {
-        const rows = data.data.slice(0, MAX_ROWS_IN_REPLY);
-        const cols = Object.keys(rows[0]);
+        const allRows = data.data;
 
-        // Use the columns that the query actually returned (not a hardcoded list)
-        // Filter out internal/meta columns
-        const skipCols = ['id', 'profile_link', 'last_scraped_at', 'last_ocr_at', 'last_manual_at', 'created_at'];
-        const displayCols = cols.filter(c => !skipCols.includes(c));
-        // If too many columns, limit to the most useful ones
-        const maxCols = 6;
-        const finalCols = displayCols.length > maxCols ? displayCols.slice(0, maxCols) : displayCols;
+        msg += `📊 *Results* (${allRows.length} found):\n\n`;
+        allRows.forEach((row, i) => {
+            const name = row.creator_name || row.username || 'Unknown';
+            const username = row.username ? `@${row.username}` : '';
+            const niche = row.niche || '-';
+            const followers = formatNumber(row.followers);
+            const avgViews = formatNumber(row.avg_views);
 
-        msg += `📊 *Results* (${data.data.length} found${data.data.length > MAX_ROWS_IN_REPLY ? `, top ${MAX_ROWS_IN_REPLY}` : ''}):\n\n`;
-        rows.forEach((row, i) => {
-            msg += `*${i + 1}. ${row.creator_name || row.username || 'Unknown'}*\n`;
-            finalCols.forEach(col => {
-                if (col === 'creator_name') return;
-                let val = row[col];
-                if (val === null || val === undefined || val === '') val = '-';
-                if ((col === 'followers' || col === 'avg_views') && !isNaN(parseInt(val))) {
-                    const n = parseInt(val);
-                    val = n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}K` : `${n}`;
-                }
-                msg += `   ${col.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}: ${val}\n`;
-            });
-            msg += '\n';
+            msg += `*${i + 1}. ${name}* ${username}\n`;
+            msg += `   Niche: ${niche} | Followers: ${followers} | Avg Views: ${avgViews}\n\n`;
+
+            // Safety: if message is getting too long, stop adding rows
+            if (msg.length > MAX_MESSAGE_LENGTH - 200) {
+                msg += `\n... _(${allRows.length - i - 1} more — use dashboard for full list)_\n`;
+                return;
+            }
         });
     } else if (!data.insight) {
-        // Only show 'no results' if there's no insight either
         msg += '📭 No results found.';
     }
 
@@ -339,14 +391,24 @@ async function queryTrakr(query) {
 // ─── Bot Core ───
 
 async function startBot() {
-    // 1. Initialize Supabase
-    if (!SUPABASE_URL || !SUPABASE_KEY) {
-        throw new Error("Missing SUPABASE_URL or SUPABASE_KEY in environment/config.");
-    }
-    const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+    // ─── AUTO-DETECT AUTH MODE ───
+    let state, saveCreds, supabase;
 
-    // 2. Fetch or create Auth State from the database
-    const { state, saveCreds } = await useSupabaseAuthState(supabase, 'wa_');
+    if (USE_SUPABASE_AUTH) {
+        // Production: Supabase-backed session persistence
+        supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+        const authResult = await useSupabaseAuthState(supabase, 'wa_');
+        state = authResult.state;
+        saveCreds = authResult.saveCreds;
+        console.log('✅ Supabase auth state loaded');
+    } else {
+        // Local dev: file-based auth
+        const authResult = await useMultiFileAuthState(AUTH_DIR);
+        state = authResult.state;
+        saveCreds = authResult.saveCreds;
+        console.log('✅ File auth state loaded from', AUTH_DIR);
+    }
+
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -385,13 +447,20 @@ async function startBot() {
                 startBot();
             } else {
                 botState = { state: 'logged_out', qr: null, qrBase64: null, phone: null };
-                // If logged out (401), delete DB session entries and restart fresh
-                console.log('🔄 Session cleared from DB. Restarting bot for new QR scan...');
-                try {
-                    await supabase.from('whatsapp_auth').delete().like('file_name', 'wa_%');
-                } catch (e) {
-                    console.error('Failed to clear DB auth session', e);
+                // Clear session based on auth mode
+                if (USE_SUPABASE_AUTH && supabase) {
+                    try {
+                        await supabase.from('whatsapp_auth').delete().like('file_name', 'wa_%');
+                    } catch (e) {
+                        console.error('Failed to clear DB auth session', e);
+                    }
+                } else {
+                    const fs = require('fs');
+                    if (fs.existsSync(AUTH_DIR)) {
+                        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                    }
                 }
+                console.log('🔄 Session cleared. Restarting bot for new QR scan...');
                 startBot();
             }
         }
@@ -410,32 +479,165 @@ async function startBot() {
 
         for (const msg of messages) {
             try {
+                console.log(`\n🔍 [DEBUG] RAW MSG received from: ${msg.key.remoteJid} | fromMe: ${msg.key.fromMe}`);
+
                 const jid = msg.key.remoteJid;
-                if (!jid || !jid.endsWith('@g.us')) continue;
+                const isGroup = jid?.endsWith('@g.us');
+                const isDM = jid?.endsWith('@s.whatsapp.net') || jid?.endsWith('@lid');
+                
+                if (!isGroup && !isDM) {
+                    console.log(`🚫 [DEBUG] Skipped: Not a Group or DM (JID: ${jid})`);
+                    continue;
+                }
 
                 // Store ALL messages in history
                 addToHistory(jid, msg);
 
-                if (msg.key.fromMe) continue;
+                if (msg.key.fromMe) {
+                    console.log(`🚫 [DEBUG] Skipped: fromMe is true (Bot won't reply to itself)`);
+                    continue;
+                }
 
-                // Extract text from ALL possible WhatsApp message types
+                // Extract text from ALL possible WhatsApp message types (including expiring/ephemeral messages)
                 const text = msg.message?.conversation
                     || msg.message?.extendedTextMessage?.text
                     || msg.message?.imageMessage?.caption
                     || msg.message?.videoMessage?.caption
+                    || msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text
+                    || msg.message?.ephemeralMessage?.message?.conversation
+                    || msg.message?.ephemeralMessage?.message?.imageMessage?.caption
                     || '';
 
-                if (!text) continue;
+                const hasImage = !!(msg.message?.imageMessage || msg.message?.ephemeralMessage?.message?.imageMessage);
+                console.log(`💬 [DEBUG] Extracted Text: "${text}" | Has Image: ${hasImage}`);
+
+                // ─── HANDLE SCREENSHOTS DURING PENDING SCRAPE ───
+                // If we're awaiting screenshots and user sends an image, process it immediately
+                if (hasImage && pendingScrapes.has(jid)) {
+                    const pending = pendingScrapes.get(jid);
+                    if (pending.current && pending.current.step === 'awaiting_screenshots') {
+                        const username = pending.current.username;
+                        console.log(`📸 [PENDING] Screenshot received for @${username}, processing...`);
+                        
+                        // Get the actual image message (could be in ephemeral wrapper)
+                        const imgMsg = msg.message?.imageMessage 
+                            ? msg 
+                            : { ...msg, message: { imageMessage: msg.message?.ephemeralMessage?.message?.imageMessage } };
+                        
+                        const result = await processImage(imgMsg, username);
+                        if (result.success) {
+                            await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.success)} Screenshot processed for *@${username}*! Send more screenshots or type "done" to finish.` }, { quoted: msg });
+                        } else {
+                            console.error(`  OCR failed: ${result.error}`);
+                            await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} Couldn't read that screenshot. Try a clearer one, or type "done" to move on.` }, { quoted: msg });
+                        }
+                        continue;
+                    }
+                }
+
+                // Store images even without text (for screenshot collection)
+                if (!text && hasImage) {
+                    console.log(`📸 [DEBUG] Image without text — storing in history and skipping reply.`);
+                    continue;
+                }
+                
+                if (!text) {
+                    console.log(`🚫 [DEBUG] Skipped: No readable text found. Available message keys:`, msg.message ? Object.keys(msg.message) : 'none');
+                    continue;
+                }
+
+                // ─── CHECK PENDING SCRAPE STATE ───
+                // If we're waiting for mandatory fields from this chat, handle that first
+                if (pendingScrapes.has(jid)) {
+                    const pending = pendingScrapes.get(jid);
+                    if (pending.current && pending.current.step === 'awaiting_mandatory') {
+                        // Parse the user's response for language, niche, gender
+                        const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+                        let language = '', niche = '', gender = '';
+
+                        for (const line of lines) {
+                            const lower = line.toLowerCase();
+                            if (lower.startsWith('language') || lower.startsWith('lang')) {
+                                language = line.split(/[:\-]\s*/)[1]?.trim() || line.replace(/language\s*/i, '').trim();
+                            } else if (lower.startsWith('niche') || lower.startsWith('nich')) {
+                                niche = line.split(/[:\-]\s*/)[1]?.trim() || line.replace(/niche\s*/i, '').trim();
+                            } else if (lower.startsWith('gender') || lower.startsWith('gen')) {
+                                gender = line.split(/[:\-]\s*/)[1]?.trim() || line.replace(/gender\s*/i, '').trim();
+                            }
+                        }
+
+                        // If couldn't parse structured input, try single-line "Hindi, Finance, Male" format
+                        if (!language && !niche && !gender && lines.length === 1) {
+                            const parts = text.split(/[,\/|]+/).map(p => p.trim());
+                            if (parts.length >= 3) {
+                                language = parts[0];
+                                niche = parts[1];
+                                gender = parts[2];
+                            }
+                        }
+
+                        if (!language || !niche || !gender) {
+                            await sock.sendMessage(jid, {
+                                text: `⚠️ I need all 3 fields. Please reply like this:\n\nLanguage: Hindi\nNiche: Finance\nGender: Male\n\n_Or in one line:_ Hindi, Finance, Male`
+                            }, { quoted: msg });
+                            continue;
+                        }
+
+                        // Update the DB with mandatory fields
+                        const username = pending.current.username;
+                        try {
+                            for (const [field, value] of [['language', language], ['niche', niche], ['gender', gender]]) {
+                                await fetch(`${TRAKR_API_URL}/api/update-field`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ username, field, value })
+                                });
+                            }
+                            await sock.sendMessage(jid, {
+                                text: `${randomFrom(REACTIONS.success)} *@${username}* updated!\n   Language: ${language}\n   Niche: ${niche}\n   Gender: ${gender}\n\n📸 _Want to share analytics screenshots for more data? Send them now, or type "skip" to move on._`
+                            }, { quoted: msg });
+                            pending.current.step = 'awaiting_screenshots';
+                        } catch (e) {
+                            await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} Failed to update fields: ${e.message}` }, { quoted: msg });
+                            pendingScrapes.delete(jid);
+                        }
+                        continue;
+                    }
+
+                    if (pending.current && pending.current.step === 'awaiting_screenshots') {
+                        const lower = text.toLowerCase().trim();
+                        if (lower === 'skip' || lower === 'no' || lower === 'next' || lower === 'done') {
+                            // Move to next in queue
+                            const nextUsername = pending.queue.shift();
+                            if (nextUsername) {
+                                await processScrapeForUser(sock, jid, msg, nextUsername, pending);
+                            } else {
+                                await sock.sendMessage(jid, { text: `✅ *All done!* All creators have been processed. 🎉` }, { quoted: msg });
+                                pendingScrapes.delete(jid);
+                            }
+                            continue;
+                        }
+
+                        // Any other text while awaiting screenshots — remind them
+                        await sock.sendMessage(jid, {
+                            text: `📸 I'm waiting for analytics screenshots for *@${pending.current.username}*. Send screenshot images, or type "done" to move on.`
+                        }, { quoted: msg });
+                        continue;
+                    }
+                }
 
                 // ─── ACTIVATION CHECK ───
-                // Only activate on direct @mention in the message text
                 const mentionRe = new RegExp(`\\b${BOT_NAME}\\b`, 'i');
-                if (!mentionRe.test(text)) continue;
+                if (isGroup && !mentionRe.test(text)) continue;
+                // In DMs, always activate
 
-                console.log(`📩 [ACTIVATED] Direct @${BOT_NAME} mention detected`);
+                if (isGroup) {
+                    console.log(`📩 [GROUP] @${BOT_NAME} mention detected`);
+                } else {
+                    console.log(`📩 [DM] Message received`);
+                }
 
                 // ─── BUILD QUERY & CONTEXT ───
-                // Strip bot name from query
                 let query = text
                     .replace(/@\S+/g, '')
                     .replace(new RegExp(`\\b${BOT_NAME}\\b`, 'gi'), '')
@@ -443,30 +645,32 @@ async function startBot() {
 
                 let agentContext = null;
 
-                // ─── EXTRACT QUOTED/TAGGED MESSAGE CONTEXT ───
-                // When user replies to a message and tags @finbot, pull the quoted text as context
-                const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
+                // Extract quoted/tagged message context (works for both ephemeral and regular messages)
+                const contextInfo = msg.message?.extendedTextMessage?.contextInfo
+                    || msg.message?.ephemeralMessage?.message?.extendedTextMessage?.contextInfo;
                 if (contextInfo?.quotedMessage) {
                     const quoted = contextInfo.quotedMessage;
                     const quotedText = quoted.conversation
                         || quoted.extendedTextMessage?.text
                         || quoted.imageMessage?.caption
                         || quoted.videoMessage?.caption
+                        || quoted.ephemeralMessage?.message?.conversation
+                        || quoted.ephemeralMessage?.message?.extendedTextMessage?.text
                         || '';
                     if (quotedText) {
-                        // Truncate to avoid blowing up the LLM context window
-                        agentContext = quotedText.length > 1500
-                            ? quotedText.slice(0, 1500) + '...'
+                        agentContext = quotedText.length > 2000
+                            ? quotedText.slice(0, 2000) + '...'
                             : quotedText;
-                        console.log(`💬 [CONTEXT] Quoted message detected (${quotedText.length} chars)`);
+                        console.log(`📎 [CONTEXT] Quoted message found (${quotedText.length} chars)`);
                     }
                 }
 
-                // Also check for IG links in the full text and chat history
+                // Check for IG links
                 const igFromText = extractInstagramUsername(text);
-                const historyContext = findContextFromHistory(jid);
+                const allIgUsernames = extractAllInstagramUsernames(text);
+                const historyIgUsername = findUsernameFromHistory(jid);
 
-                console.log(`🧠 [PRE-AGENT] Query: "${query}" | Context: ${agentContext ? 'yes' : 'none'} | IG: ${igFromText || historyContext.instagramUsername || 'none'}`);
+                console.log(`🧠 [PRE-AGENT] Query: "${query}" | IG links: ${allIgUsernames.length} | Context: ${agentContext ? 'yes' : 'none'}`);
 
                 // ─── AGENT: CLASSIFY INTENT ───
                 await sock.sendMessage(jid, { react: { text: randomFrom(REACTIONS.thinking), key: msg.key } });
@@ -478,15 +682,16 @@ async function startBot() {
                 // ACTION: GREETING
                 // ═══════════════════════════════════════════
                 if (intent.action === 'greeting') {
+                    const prefix = isDM ? '' : `@${BOT_NAME} `;
                     const greetingText = intent.greeting_response || 
                         `🤖 *Yo! I'm FinBot — your influencer intel assistant.*\n\n` +
                         `🔍 *Ask me anything:*\n` +
-                        `• _@${BOT_NAME} show all creators_\n` +
-                        `• _@${BOT_NAME} who has the most followers?_\n\n` +
+                        `• _${prefix}show all creators_\n` +
+                        `• _${prefix}who has the most followers?_\n\n` +
                         `📸 *Feed me data:*\n` +
-                        `• Drop an IG link + _@${BOT_NAME} update_\n\n` +
+                        `• Drop an IG link + _${prefix}update_\n\n` +
                         `📊 *Export:*\n` +
-                        `• _@${BOT_NAME} export to sheet_\n\n` +
+                        `• _${prefix}export to sheet_\n\n` +
                         `_Just reply to any of my messages to follow up!_ 💬`;
                     await sock.sendMessage(jid, { text: greetingText }, { quoted: msg });
                     await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
@@ -508,7 +713,6 @@ async function startBot() {
                             `🔗 ${result.url}\n\n` +
                             `_Anyone with the link can view & edit._ 😎`;
 
-                        // If search_and_export, also show the search results
                         if (intent.action === 'search_and_export' && searchQuery) {
                             const searchResult = await queryTrakr(searchQuery);
                             replyText = formatReply(searchResult) + '\n\n' + replyText;
@@ -529,12 +733,32 @@ async function startBot() {
                 // ACTION: UPDATE_FIELD (modify DB column)
                 // ═══════════════════════════════════════════
                 if (intent.action === 'update_field') {
-                    const username = intent.instagram_username || historyContext.instagramUsername || igFromText;
+                    // Extract username: try agent > IG link in text > IG link from quoted context > history
+                    let username = intent.instagram_username || igFromText || historyIgUsername;
+
+                    // Also try to extract from quoted message context if available
+                    if (!username && agentContext) {
+                        username = extractInstagramUsername(agentContext);
+                    }
+
                     const field = intent.update_field_name;
                     const value = intent.update_field_value;
 
+                    // If user sent a link + "update this person details" but no specific field/value,
+                    // SCRAPE the profile first (to get name/followers/etc), then ask for mandatory fields
+                    if (username && (!field || value === undefined || value === null)) {
+                        const pending = { queue: [], current: null };
+                        pendingScrapes.set(jid, pending);
+                        
+                        // Scrape the profile first to get basic data
+                        await processScrapeForUser(sock, jid, msg, username, pending);
+                        
+                        await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
+                        continue;
+                    }
+
                     if (!username || !field || value === undefined || value === null) {
-                        await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} I need the creator's username, the field, and the new value to update correctly.` }, { quoted: msg });
+                        await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} I need the creator's Instagram link or username, the field, and the new value to update correctly.` }, { quoted: msg });
                         await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
                         continue;
                     }
@@ -555,7 +779,7 @@ async function startBot() {
                             await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} Field update failed: ${data.error}` }, { quoted: msg });
                         }
                     } catch (e) {
-                         await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.error)} Error saving to database: ${e.message}` }, { quoted: msg });
+                         await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} Error saving to database: ${e.message}` }, { quoted: msg });
                     }
                     
                     await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
@@ -566,72 +790,35 @@ async function startBot() {
                 // ACTION: SCRAPE (fetch from Instagram)
                 // ═══════════════════════════════════════════
                 if (intent.action === 'scrape') {
-                    // Get username from: agent extraction > text > chat history
-                    const username = intent.instagram_username
-                        || igFromText
-                        || historyContext.instagramUsername;
+                    // Collect all IG usernames: from text > agent extraction > history
+                    let usernames = allIgUsernames.length > 0
+                        ? allIgUsernames
+                        : (intent.instagram_username ? [intent.instagram_username] : []);
 
-                    if (!username) {
+                    if (usernames.length === 0 && igFromText) usernames = [igFromText];
+                    // Don't fall back to history — user must provide links explicitly for scraping
+
+                    if (usernames.length === 0) {
                         await sock.sendMessage(jid, { text: quip('noLink') }, { quoted: msg });
                         await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
                         continue;
                     }
 
-                    const hasScreenshots = historyContext.images.length > 0;
-
-                    await sock.sendMessage(jid, {
-                        text: `${quip('scrapeStart')}\n\n👤 Target: *@${username}*${hasScreenshots ? `\n📸 Screenshots found: *${historyContext.images.length}*` : ''}`,
-                    }, { quoted: msg });
-
-                    const scrapeResult = await callScraper(username);
-                    let reply = '';
-
-                    if (scrapeResult.success) {
-                        const d = scrapeResult.data;
-                        reply += `${randomFrom(QUIPS.scrapeSuccess)}\n`;
-                        reply += `   👤 *${d.creatorName || username}*\n`;
-                        reply += `   👥 Followers: *${d.followers ? (d.followers >= 1e6 ? `${(d.followers / 1e6).toFixed(1)}M` : d.followers >= 1e3 ? `${(d.followers / 1e3).toFixed(1)}K` : d.followers) : '-'}*\n\n`;
-                    } else {
-                        reply += `${randomFrom(REACTIONS.fail)} Scrape hiccup: ${scrapeResult.error}\n\n`;
+                    if (usernames.length > 1) {
+                        await sock.sendMessage(jid, {
+                            text: `📋 *Found ${usernames.length} Instagram profiles!* I'll process them one by one.\n\n${usernames.map((u, i) => `${i + 1}. @${u}`).join('\n')}`
+                        }, { quoted: msg });
                     }
 
-                    // OCR if screenshots present
-                    if (hasScreenshots) {
-                        let ocrSuccess = 0;
-                        let extractedFields = [];
+                    // Set up the queue: first goes to processing, rest wait
+                    const pending = {
+                        queue: usernames.slice(1),
+                        current: null,
+                    };
+                    pendingScrapes.set(jid, pending);
 
-                        for (let i = 0; i < historyContext.images.length; i++) {
-                            const result = await processImage(historyContext.images[i], username);
-                            if (result.success) {
-                                ocrSuccess++;
-                                if (result.result) {
-                                    Object.entries(result.result).forEach(([k, v]) => {
-                                        if (v && v !== '' && v !== '-' && v !== 'N/A' && !extractedFields.includes(k)) {
-                                            extractedFields.push(k);
-                                        }
-                                    });
-                                }
-                            } else {
-                                console.error(`  Screenshot ${i + 1} failed: ${result.error}`);
-                            }
-                        }
+                    await processScrapeForUser(sock, jid, msg, usernames[0], pending);
 
-                        if (ocrSuccess > 0) {
-                            reply += `📸 *OCR nailed it!* ${ocrSuccess}/${historyContext.images.length} screenshot(s) processed\n`;
-                            if (extractedFields.length > 0) {
-                                const labels = extractedFields.map(f => f.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()));
-                                reply += `📋 *Data pulled:* ${labels.join(', ')}\n`;
-                            }
-                            reply += `\n_Database updated. Check the dashboard anytime._ 💅`;
-                        } else {
-                            reply += `${randomFrom(REACTIONS.fail)} OCR couldn't read the screenshot(s). Make sure they're clear!`;
-                        }
-                    } else {
-                        reply += quip('noScreenshots');
-                    }
-
-                    await sock.sendMessage(jid, { text: reply.trim() }, { quoted: msg });
-                    console.log(`✅ Updated @${username}: scrape=${scrapeResult.success}, OCR=${hasScreenshots ? historyContext.images.length : 'none'}`);
                     await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
                     continue;
                 }
@@ -658,15 +845,77 @@ async function startBot() {
     });
 }
 
+/**
+ * Process a single scrape: scrape profile → OCR screenshots → ask mandatory fields.
+ */
+async function processScrapeForUser(sock, jid, msg, username, pending) {
+    const screenshots = findRecentScreenshots(jid);
+    const hasScreenshots = screenshots.length > 0;
+
+    await sock.sendMessage(jid, {
+        text: `${quip('scrapeStart')}\n\n👤 Target: *@${username}*${hasScreenshots ? `\n📸 Screenshots found: *${screenshots.length}*` : ''}`,
+    }, { quoted: msg });
+
+    const scrapeResult = await callScraper(username);
+    let reply = '';
+
+    if (scrapeResult.success) {
+        const d = scrapeResult.data;
+        reply += `${randomFrom(QUIPS.scrapeSuccess)}\n`;
+        reply += `   👤 *${d.creatorName || username}*\n`;
+        reply += `   👥 Followers: *${formatNumber(d.followers)}*\n\n`;
+    } else {
+        reply += `${randomFrom(REACTIONS.fail)} Scrape hiccup: ${scrapeResult.error}\n\n`;
+    }
+
+    // OCR if screenshots are present (only from last 3 messages)
+    if (hasScreenshots) {
+        let ocrSuccess = 0;
+        let extractedFields = [];
+
+        for (let i = 0; i < screenshots.length; i++) {
+            const result = await processImage(screenshots[i], username);
+            if (result.success) {
+                ocrSuccess++;
+                if (result.result) {
+                    Object.entries(result.result).forEach(([k, v]) => {
+                        if (v && v !== '' && v !== '-' && v !== 'N/A' && !extractedFields.includes(k)) {
+                            extractedFields.push(k);
+                        }
+                    });
+                }
+            } else {
+                console.error(`  Screenshot ${i + 1} failed: ${result.error}`);
+            }
+        }
+
+        if (ocrSuccess > 0) {
+            reply += `📸 *OCR processed!* ${ocrSuccess}/${screenshots.length} screenshot(s)\n`;
+            if (extractedFields.length > 0) {
+                const labels = extractedFields.map(f => f.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()));
+                reply += `📋 *Data pulled:* ${labels.join(', ')}\n`;
+            }
+        }
+    }
+
+    await sock.sendMessage(jid, { text: reply.trim() });
+
+    // Now ask for mandatory fields
+    pending.current = { username, step: 'awaiting_mandatory', data: {} };
+    await sock.sendMessage(jid, {
+        text: `📝 *Before I finalize @${username}, I need 3 details:*\n\nPlease reply with:\nLanguage: (e.g. Hindi)\nNiche: (e.g. Finance)\nGender: (e.g. Male)\n\n_Or in one line:_ Hindi, Finance, Male`
+    });
+}
+
 console.log(`
 ╔══════════════════════════════════════════╗
 ║  🧠 FinBot — TRAKR Agentic Bot          ║
 ║  "I think, therefore I bot."            ║
 ╚══════════════════════════════════════════╝
-Bot trigger:  @${BOT_NAME}
+Bot trigger:  @${BOT_NAME} (groups) / direct (DMs)
 API server:   ${TRAKR_API_URL}
 Routing:      LLM-powered (agent.js)
-Activation:   @mention only
+Activation:   @mention (groups) + all DMs
 `);
 
 startBot().catch(err => {

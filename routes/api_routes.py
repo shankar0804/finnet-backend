@@ -121,9 +121,19 @@ def upload_file():
         ocr_update["last_ocr_at"] = datetime.now(timezone.utc).isoformat()
         
         try:
-            supabase.table("influencers").update(ocr_update).eq("username", target_username).execute()
+            # First check if the row exists
+            existing = supabase.table("influencers").select("username").eq("username", target_username).execute()
+            if existing.data and len(existing.data) > 0:
+                # Row exists — update it
+                result = supabase.table("influencers").update(ocr_update).eq("username", target_username).execute()
+                logger.info(f"[OCR] Updated {len(ocr_update)} fields for @{target_username}: {list(ocr_update.keys())}")
+            else:
+                # Row doesn't exist — create it with the OCR data
+                insert_data = {"username": target_username, **ocr_update}
+                result = supabase.table("influencers").upsert(insert_data, on_conflict="username").execute()
+                logger.info(f"[OCR] Created new row for @{target_username} with {len(ocr_update)} fields")
         except Exception as db_err:
-            logger.error(f"Failed to push OCR to Supabase: {db_err}")
+            logger.error(f"Failed to push OCR to Supabase for @{target_username}: {db_err}")
             # Non-fatal error
             
         # Layer 3: Optionally Sync to Google Sheets

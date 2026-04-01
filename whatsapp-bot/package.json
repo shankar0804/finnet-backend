@@ -7,8 +7,9 @@
         "start": "node bot.js"
     },
     "dependencies": {
+        "@supabase/supabase-js": "^2.101.1",
         "@whiskeysockets/baileys": "^6.7.16",
-        "@supabase/supabase-js": "^2.45.0",
+        "dotenv": "^17.3.1",
         "form-data": "^4.0.5",
         "pino": "^9.6.0",
         "qrcode": "^1.5.4",

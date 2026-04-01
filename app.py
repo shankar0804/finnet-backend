@@ -5,6 +5,10 @@ import subprocess
 import atexit
 from flask import Flask, jsonify
 from flask_cors import CORS
+from dotenv import load_dotenv
+
+# Load all keys from .env early
+load_dotenv()
 
 # Import the modular Blueprints
 from routes.view_routes import view_bp
@@ -21,7 +25,7 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24).hex())
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
-# Enable CORS for Vercel frontend
+# Enable CORS for frontend (Vercel or local)
 FRONTEND_URL = os.environ.get('FRONTEND_URL', '*')
 CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
 

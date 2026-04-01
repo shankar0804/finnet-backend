@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS influencers (
     male_pct VARCHAR(20) DEFAULT '',
     female_pct VARCHAR(20) DEFAULT '',
 
+    -- Creator Gender (user-provided mandatory field)
+    gender VARCHAR(20) DEFAULT '',
+
     -- Top Cities (OCR)
     city_1 VARCHAR(100) DEFAULT '',
     city_2 VARCHAR(100) DEFAULT '',
@@ -53,13 +56,3 @@ CREATE POLICY "Allow anonymous read access" ON influencers FOR SELECT USING (tru
 CREATE POLICY "Allow anonymous insert access" ON influencers FOR INSERT WITH CHECK (true);
 CREATE POLICY "Allow anonymous update access" ON influencers FOR UPDATE USING (true);
 CREATE POLICY "Allow anonymous delete access" ON influencers FOR DELETE USING (true);
-
--- WhatsApp Bot Session Persistence (survives container restarts)
-CREATE TABLE IF NOT EXISTS whatsapp_auth (
-    file_name TEXT PRIMARY KEY,
-    file_data TEXT NOT NULL,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-ALTER TABLE whatsapp_auth ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "Allow anon full access to wa_auth" ON whatsapp_auth FOR ALL USING (true) WITH CHECK (true);

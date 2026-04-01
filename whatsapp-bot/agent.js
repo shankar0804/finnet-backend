@@ -20,8 +20,11 @@ Given a user message (and optionally conversation context), classify the user's 
 
 ## Rules:
 - If the user asks about data, influencers, creators, stats → **search** 
-- Only use **scrape** if the user explicitly wants to ADD/FETCH/SCRAPE a new profile from an Instagram link or username.
+- Only use **scrape** if the user explicitly wants to ADD/FETCH/SCRAPE a new profile from an Instagram link or username. Keywords: "add", "scrape", "save", "fetch this profile".
+- **NEVER** auto-scrape a bare Instagram link. If someone just sends a link with no action word, classify as **search** with a query about that user.
+- If someone sends a link with "update" → classify as **update_field** and extract the Instagram username from the link.
 - Only use **update_field** if they want to physically edit data for an existing creator (e.g., "change his niche to finance"). Set 'update_field_name' (e.g., "niche", "cost", "email") and 'update_field_value' to the new value. Set 'instagram_username' to the target creator.
+- If someone sends a link + "update this person details" or "update details" with NO specific field or value, set action=**update_field**, extract the username, and leave update_field_name and update_field_value as null. The bot will handle asking for details.
 - "fetch all influencers" = search (they want to SEE data). "fetch @xyz profile" = scrape (they want to SCRAPE it)
 - If unsure, default to **search**
 - For **scrape**: extract the Instagram username from any URL like instagram.com/username or @username
@@ -85,7 +88,16 @@ Context: Previous bot reply showed Top 10 gaming creators in NY. User: "male cre
 {"action":"search","query":"Top 10 gaming male creators in NY","instagram_username":null,"greeting_response":null}
 
 Context: Previous bot reply showed metrics for Sharan Hegde. User: "put this in a sheet"
-{"action":"export","query":"Sharan Hegde","instagram_username":null,"greeting_response":null}`;
+{"action":"export","query":"Sharan Hegde","instagram_username":null,"greeting_response":null}
+
+User: "https://www.instagram.com/riaspeaks/"
+{"action":"search","query":"show details for riaspeaks","instagram_username":null,"greeting_response":null}
+
+User: "https://www.instagram.com/riaspeaks/ update this person details"
+{"action":"update_field","query":null,"instagram_username":"riaspeaks","update_field_name":null,"update_field_value":null,"greeting_response":null}
+
+Context: Previous bot reply showed a numbered list of 11 creators. User: "give me only details of 1 3 5"
+{"action":"search","query":"show details of Mark Zuckerberg, Pankit Narang, and Ria","instagram_username":null,"greeting_response":null}`;
 
 /**
  * Classify user intent using NVIDIA LLM.
@@ -168,9 +180,9 @@ function fallbackClassify(text) {
         return { action: 'scrape', query: null, instagram_username: igUsername, greeting_response: null };
     }
 
-    // If IG link present but no scrape words, still scrape
+    // If IG link present but no scrape words, DON'T auto-scrape — treat as search
     if (igUsername) {
-        return { action: 'scrape', query: null, instagram_username: igUsername, greeting_response: null };
+        return { action: 'search', query: `show details for ${igUsername}`, instagram_username: null, greeting_response: null };
     }
 
     // Default: search

@@ -1,6 +1,5 @@
 """Google Sheets export via service account with domain-wide delegation."""
 import os
-import json
 import logging
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -8,14 +7,6 @@ from googleapiclient.discovery import build
 logger = logging.getLogger(__name__)
 
 SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'service_account.json')
-
-# In cloud (Render), the JSON is stored as an env var since GitHub blocks secret files
-if not os.path.exists(SERVICE_ACCOUNT_FILE):
-    sa_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON', '')
-    if sa_json:
-        with open(SERVICE_ACCOUNT_FILE, 'w') as f:
-            f.write(sa_json)
-        logger.info("Wrote service_account.json from env var")
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'

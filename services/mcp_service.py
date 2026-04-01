@@ -1,15 +1,19 @@
 import json
+import re
 import time
 import sqlite3
+import logging
 import pandas as pd
 from openai import OpenAI
 from database.db import supabase
 
-import os
+logger = logging.getLogger(__name__)
 
 # ── Data cache to avoid fetching from Supabase on every query ──
 _cache = {"data": None, "timestamp": 0}
 CACHE_TTL = 60  # seconds
+
+import os
 
 NVIDIA_KEY = os.environ.get("NVIDIA_KEY", "").strip()
 
@@ -38,6 +42,7 @@ SCHEMA = {
         "age_45_54": "text",
         "male_pct": "text",
         "female_pct": "text",
+        "gender": "text",
         "city_1": "text",
         "city_2": "text",
         "city_3": "text",
@@ -53,152 +58,147 @@ SCHEMA = {
 }
 
 VALID_COLUMNS = set(SCHEMA["columns"].keys())
-VALID_OPS = {"=", "!=", ">", "<", ">=", "<=", "like", "is_null", "is_not_null"}
+
+# Columns with types for the prompt
+COLUMNS_WITH_TYPES = "\n".join(f"  - {col} ({dtype})" for col, dtype in SCHEMA["columns"].items())
 
 
-def build_sql_from_spec(spec: dict) -> str:
-    """Deterministically builds a safe SQL query from a validated JSON spec."""
-    import logging
-    logger = logging.getLogger(__name__)
-    
-    columns = spec.get("columns", ["*"])
-    if columns == ["*"] or not columns:
-        col_str = "*"
-    else:
-        safe_cols = [c for c in columns if c in VALID_COLUMNS]
-        col_str = ", ".join(safe_cols) if safe_cols else "*"
+# ─── SQL SAFETY VALIDATOR ───────────────────────────────────────────
 
-    sql = f"SELECT {col_str} FROM influencers"
+def validate_sql(sql: str) -> tuple:
+    """
+    Multi-layer safety validation for LLM-generated SQL.
+    Returns (is_safe: bool, error_message: str, cleaned_sql: str)
+    """
+    if not sql or not sql.strip():
+        return False, "Empty SQL query", ""
 
-    # Build WHERE conditions list (assembled into SQL later)
-    filters = spec.get("filters", [])
-    conditions = []
-    for f in filters:
-        col = f.get("column", "")
-        op = f.get("op", "=").lower()
-        val = f.get("value")
+    cleaned = sql.strip().rstrip(";").strip()
 
-        if col not in VALID_COLUMNS or op not in VALID_OPS:
-            continue
+    # Layer 1: Must be a SELECT statement (read-only)
+    if not cleaned.upper().startswith("SELECT"):
+        return False, "Only SELECT queries are allowed", ""
 
-        col_type = SCHEMA["columns"][col]
+    # Layer 2: Block dangerous keywords
+    dangerous_keywords = [
+        'DROP', 'DELETE', 'INSERT', 'UPDATE', 'ALTER', 'CREATE',
+        'TRUNCATE', 'EXEC', 'EXECUTE', 'GRANT', 'REVOKE', 'ATTACH',
+        'DETACH', 'PRAGMA', 'REPLACE', 'MERGE', 'CALL',
+    ]
+    sql_upper = cleaned.upper()
+    for kw in dangerous_keywords:
+        if re.search(rf'\b{kw}\b', sql_upper):
+            return False, f"Blocked: dangerous keyword '{kw}' detected", ""
 
-        # Handle null/blank checks
-        if op == "is_null":
-            conditions.append(f"({col} IS NULL OR TRIM({col}) = '')")
-            continue
-        elif op == "is_not_null":
-            conditions.append(f"({col} IS NOT NULL AND TRIM({col}) != '')")
-            continue
+    # Layer 3: Only allow the 'influencers' table
+    from_matches = re.findall(r'\bFROM\s+(\w+)', sql_upper)
+    join_matches = re.findall(r'\bJOIN\s+(\w+)', sql_upper)
+    all_tables = from_matches + join_matches
+    for table in all_tables:
+        if table != 'INFLUENCERS':
+            return False, f"Blocked: unauthorized table '{table}'", ""
 
-        if op == "like":
-            conditions.append(f"LOWER({col}) LIKE LOWER('%{val}%')")
-        elif col_type in ("integer", "real"):
-            try:
-                num_val = float(val) if col_type == "real" else int(val)
-                conditions.append(f"{col} {op} {num_val}")
-            except (ValueError, TypeError):
-                conditions.append(f"LOWER({col}) LIKE LOWER('%{val}%')")
-        else:
-            safe_val = str(val).replace("'", "''")
-            if op == "=":
-                conditions.append(f"LOWER({col}) LIKE LOWER('%{safe_val}%')")
-            else:
-                conditions.append(f"{col} {op} '{safe_val}'")
+    # Layer 4: Ensure at least one valid table is referenced
+    if 'INFLUENCERS' not in sql_upper:
+        return False, "Query must reference the 'influencers' table", ""
 
-    # ORDER BY — check sort BEFORE assembling WHERE, so we can add null filters
-    order_clause = ""
-    sort = spec.get("sort")
-    if sort:
-        sort_col = sort.get("column", "")
-        sort_dir = "DESC" if sort.get("direction", "").upper() == "DESC" else "ASC"
-        if sort_col in VALID_COLUMNS:
-            # For numeric columns, filter out NULLs/0s so rows with no data don't pollute results
-            col_type = SCHEMA["columns"].get(sort_col, "text")
-            if col_type in ("integer", "real"):
-                conditions.append(f"({sort_col} IS NOT NULL AND {sort_col} > 0)")
-            order_clause = f" ORDER BY {sort_col} {sort_dir}"
+    # Layer 5: Enforce a safety LIMIT to prevent huge result sets
+    if 'LIMIT' not in sql_upper:
+        cleaned += " LIMIT 200"
 
-    # NOW assemble WHERE from all conditions (including sort-related null filters)
-    if conditions:
-        sql += " WHERE " + " AND ".join(conditions)
+    # Layer 6: Block subqueries to other tables
+    subquery_froms = re.findall(r'\(\s*SELECT[^)]*FROM\s+(\w+)', sql_upper)
+    for table in subquery_froms:
+        if table != 'INFLUENCERS':
+            return False, f"Blocked: subquery references unauthorized table '{table}'", ""
 
-    sql += order_clause
-
-    # LIMIT
-    limit = spec.get("limit")
-    if limit and isinstance(limit, int) and 0 < limit <= 500:
-        sql += f" LIMIT {limit}"
-    else:
-        sql += " LIMIT 50"
-
-    logger.info(f"[MCP] Generated SQL: {sql}")
-    logger.info(f"[MCP] From spec: {json.dumps(spec)}")
-
-    return sql
+    return True, "OK", cleaned
 
 
-SYSTEM_PROMPT = f"""You are an expert database query translator for an influencer talent agency. Convert ANY user question into a precise JSON filter specification that will be used to query a SQL database.
+# ─── SYSTEM PROMPT FOR DIRECT SQL GENERATION ────────────────────────
 
-**Database table: `influencers`**
-**Available columns with types:**
-{json.dumps(SCHEMA["columns"], indent=2)}
+SYSTEM_PROMPT = f"""You are an expert SQLite query writer for an influencer talent agency database.
 
-**Available filter operators:**
-- `=` — exact match (for text, becomes case-insensitive LIKE)
-- `!=` — not equal
-- `>`, `<`, `>=`, `<=` — numeric comparisons
-- `like` — partial text match (case-insensitive)
-- `is_null` — column is empty, blank, or missing (no value needed)
-- `is_not_null` — column has a non-empty value (no value needed)
+**Your job:** Convert the user's natural language question into a SINGLE valid SQLite SELECT query.
 
-**Output format (JSON only, NO markdown, NO explanation):**
-{{
-  "columns": ["*"] or ["col1", "col2", ...],
-  "filters": [
-    {{"column": "exact_column_name", "op": "operator", "value": "value or null for is_null/is_not_null"}}
-  ],
-  "sort": {{"column": "column_name", "direction": "ASC|DESC"}} or null,
-  "limit": number
-}}
+**Database: SQLite (in-memory)**
+**Table: `influencers`**
+**Columns:**
+{COLUMNS_WITH_TYPES}
 
-**Critical Rules:**
-1. Use ONLY column names from the schema above. Never invent columns.
-2. For text searches use `like`. For numbers use numeric operators.
-3. For questions about missing/blank/empty data, use `is_null`. For questions about filled/complete data, use `is_not_null`.
-4. Select ONLY the columns relevant to the question. If the user asks about specific fields (niche, location, etc.), include those columns.
-5. When the user asks about "blank" or "missing" or "empty" fields for creators, filter WHERE those specific columns `is_null`.
-6. When the user asks "what data is missing" without specifying a field, select ALL columns so the answer can show which are blank.
-7. Think carefully about what the user is ACTUALLY asking. Translate their intent into the right filters.
-8. Default limit is 50. Use a smaller limit only if the user asks for a specific number (e.g. "top 5").
-9. Output ONLY valid JSON. No text before or after.
-10. For "lowest", "least", "minimum", "smallest" questions: use sort ASC with limit 1. Do NOT add numeric filters like < 0.
-11. For "highest", "most", "maximum", "largest", "top" questions: use sort DESC with limit 1 (or the number the user specifies).
-12. ALWAYS use sort + limit for superlative queries (best, worst, highest, lowest, etc.). NEVER guess a filter value.
+**Rules:**
+1. Write ONLY a single SELECT statement. No explanations, no markdown, no code fences.
+2. Use ONLY the columns listed above. Never invent columns.
+3. The table name is `influencers` — use ONLY this table.
+4. **DEFAULT columns** for most queries: `creator_name, username, profile_link, niche, followers, avg_views`. Only add extra columns if the user explicitly asks about them.
+5. Use `SELECT *` ONLY when the user asks about ALL data, missing fields, or analytical deep-dives.
+6. For text columns, empty/missing values may be NULL or empty string ''. To check for missing data, use: `(column IS NULL OR TRIM(column) = '')`
+7. For numeric columns (followers, avg_views, engagement_rate, avg_video_length), missing data is NULL or 0. To find valid data: `column IS NOT NULL AND column > 0`
+8. Use case-insensitive matching for text: `LOWER(column) LIKE LOWER('%value%')`
+9. Do NOT add a LIMIT unless the user says "top N" or a specific number. Return all matching results by default.
+10. For "lowest"/"least"/"minimum" → ORDER BY column ASC LIMIT 1 (filter out NULLs/0s for numeric columns)
+11. For "highest"/"most"/"maximum"/"top" → ORDER BY column DESC LIMIT 1 (or N)
+12. For analytical questions like "what fields are blank/missing for each creator", SELECT all columns and return all rows.
+13. Output ONLY the raw SQL. Nothing else.
 
 **Examples:**
 
-User: "who has the lowest followers"
-{{"columns": ["*"], "filters": [], "sort": {{"column": "followers", "direction": "ASC"}}, "limit": 1}}
+User: "show all creators"
+SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers
 
-User: "lowest follower count person"
-{{"columns": ["*"], "filters": [], "sort": {{"column": "followers", "direction": "ASC"}}, "limit": 1}}
+User: "give me all creators with minimum 100k avg views"
+SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE avg_views IS NOT NULL AND avg_views >= 100000 ORDER BY avg_views DESC
 
 User: "who has the most followers"
-{{"columns": ["*"], "filters": [], "sort": {{"column": "followers", "direction": "DESC"}}, "limit": 1}}
+SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE followers IS NOT NULL AND followers > 0 ORDER BY followers DESC LIMIT 1
 
-User: "top 5 creators by followers"
-{{"columns": ["*"], "filters": [], "sort": {{"column": "followers", "direction": "DESC"}}, "limit": 5}}
+User: "lowest follower count person"
+SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE followers IS NOT NULL AND followers > 0 ORDER BY followers ASC LIMIT 1
 
-User: "who has the highest engagement rate"
-{{"columns": ["*"], "filters": [], "sort": {{"column": "engagement_rate", "direction": "DESC"}}, "limit": 1}}
+User: "beauty creators in mumbai"
+SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE LOWER(niche) LIKE LOWER('%beauty%') AND LOWER(location) LIKE LOWER('%mumbai%')
 
-User: "show all creators"
-{{"columns": ["*"], "filters": [], "sort": null, "limit": 50}}"""
+User: "what data is missing for each creator"
+SELECT * FROM influencers
+
+User: "creators whose niche is blank"
+SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE niche IS NULL OR TRIM(niche) = ''
+
+User: "top 5 by engagement rate"
+SELECT creator_name, username, profile_link, niche, followers, avg_views, engagement_rate FROM influencers WHERE engagement_rate IS NOT NULL AND engagement_rate > 0 ORDER BY engagement_rate DESC LIMIT 5
+
+User: "who has no email"
+SELECT creator_name, username, profile_link, niche, followers, avg_views, mail_id FROM influencers WHERE mail_id IS NULL OR TRIM(mail_id) = ''
+
+User: "count of creators by niche"
+SELECT niche, COUNT(*) as count FROM influencers WHERE niche IS NOT NULL AND TRIM(niche) != '' GROUP BY niche ORDER BY count DESC
+
+User: "average followers"
+SELECT AVG(followers) as avg_followers, MIN(followers) as min_followers, MAX(followers) as max_followers FROM influencers WHERE followers IS NOT NULL AND followers > 0 LIMIT 1
+
+User: "creators with more than 1 million followers"
+SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE followers > 1000000 ORDER BY followers DESC
+
+User: "show me engagement rate for all creators"
+SELECT creator_name, username, niche, followers, avg_views, engagement_rate FROM influencers WHERE engagement_rate IS NOT NULL AND engagement_rate > 0 ORDER BY engagement_rate DESC"""
+
+
+# ─── INSIGHT PROMPT ─────────────────────────────────────────────────
+
+INSIGHT_SYSTEM = """You are a helpful data analyst for an influencer talent agency. The user asked a question and we queried the database. Your job is to DIRECTLY ANSWER their question based on the results.
+
+Rules:
+- Be specific and actionable. Name specific creators, numbers, and fields.
+- Use <strong> for emphasis on key names and numbers.
+- No code blocks, no markdown — just plain text with HTML bold tags.
+- Keep it concise (2-5 sentences).
+- If the data shows blank/null/empty fields, LIST them specifically (e.g. "Missing fields for @creator: niche, location, email").
+- If 0 results, say so clearly and suggest what the user might try instead.
+- NEVER say "the query returned no results" if data IS present. Analyze the actual data."""
 
 
 async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict:
-    """Structured JSON approach: LLM outputs a filter spec, Python builds SQL deterministically."""
+    """Direct SQL approach: LLM writes SQL, we validate & execute safely."""
     try:
         # 1. Fetch data (with 60s cache to avoid repeated Supabase round-trips)
         now = time.time()
@@ -206,74 +206,91 @@ async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict
             response = supabase.table("influencers").select("*").execute()
             _cache["data"] = response.data
             _cache["timestamp"] = now
-        
+
         db_records = _cache["data"]
         if not db_records:
             return {"type": "data", "data": [], "insight": "The database is currently empty."}
 
+        # Load into in-memory SQLite for querying
         df = pd.DataFrame(db_records)
         conn = sqlite3.connect(':memory:')
         df.to_sql('influencers', conn, index=False)
 
-        # 2. Ask LLM to produce structured JSON (NOT raw SQL)
+        # 2. Ask LLM to write SQL directly
         client_llm = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_KEY)
 
         llm_response = client_llm.chat.completions.create(
-            model="meta/llama-3.1-8b-instruct",
+            model="meta/llama-3.3-70b-instruct",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_query}
             ],
             temperature=0.0,
-            max_tokens=256
+            max_tokens=512
         )
 
-        raw_output = llm_response.choices[0].message.content.strip()
+        raw_sql = llm_response.choices[0].message.content.strip()
 
-        # 3. Parse the JSON spec (with fallback)
-        try:
-            raw_output = raw_output.replace('```json', '').replace('```', '').strip()
-            spec = json.loads(raw_output)
-        except json.JSONDecodeError:
+        # Clean markdown code fences if the LLM wraps the output
+        raw_sql = raw_sql.replace('```sql', '').replace('```', '').strip()
+        # Remove any leading explanation text (take last SQL-looking line block)
+        lines = raw_sql.split('\n')
+        sql_lines = [l for l in lines if l.strip() and not l.strip().startswith('--') and not l.strip().startswith('#')]
+        if sql_lines:
+            raw_sql = ' '.join(sql_lines)
+
+        logger.info(f"[MCP] LLM generated SQL: {raw_sql}")
+
+        # 3. Validate SQL for safety
+        is_safe, error_msg, cleaned_sql = validate_sql(raw_sql)
+        if not is_safe:
+            logger.warning(f"[MCP] SQL blocked: {error_msg} | Raw: {raw_sql}")
             return {
                 "type": "error",
-                "message": f"AI returned invalid format. Raw: {raw_output[:200]}"
+                "message": f"Query safety check failed: {error_msg}"
             }
 
-        # 4. Build SQL deterministically from the validated spec
-        sql = build_sql_from_spec(spec)
+        logger.info(f"[MCP] Executing SQL: {cleaned_sql}")
 
-        # 5. Execute
+        # 4. Execute the validated SQL
         try:
-            result_df = pd.read_sql_query(sql, conn)
+            result_df = pd.read_sql_query(cleaned_sql, conn)
         except sqlite3.Error as sql_err:
-            return {"type": "error", "message": f"Query error: {sql_err}", "sql": sql}
+            logger.error(f"[MCP] SQL execution error: {sql_err} | SQL: {cleaned_sql}")
+            # Fallback: try a simple SELECT * query
+            try:
+                fallback_sql = "SELECT * FROM influencers LIMIT 50"
+                result_df = pd.read_sql_query(fallback_sql, conn)
+                cleaned_sql = fallback_sql
+                logger.info("[MCP] Fell back to SELECT * FROM influencers")
+            except:
+                return {"type": "error", "message": f"Query error: {sql_err}", "sql": cleaned_sql}
 
-        # 6. Generate insight — always provide a smart answer to the user's question
+        # 5. Generate insight — smart answer to the user's question
         insight_text = f"Found {len(result_df)} result(s)."
         try:
-            # Show more data to the LLM for better analysis
-            sample_data = result_df.head(20).to_json(orient='records')
-            
+            sample_size = min(30, len(result_df))
+            sample_data = result_df.head(sample_size).to_json(orient='records')
+
             insight_prompt = [
-                {"role": "system", "content": "You are a helpful data analyst for an influencer agency. The user asked a question and we queried the database. Your job is to DIRECTLY ANSWER their question based on the results. Be specific and actionable. Use <strong> for emphasis. No code blocks, no markdown — just plain text with HTML bold tags. Keep it concise (2-4 sentences max)."},
-                {"role": "user", "content": f"User's question: \"{user_query}\"\n\nQuery returned {len(result_df)} rows. Data sample:\n{sample_data}"}
+                {"role": "system", "content": INSIGHT_SYSTEM},
+                {"role": "user", "content": f"User's question: \"{user_query}\"\n\nSQL used: {cleaned_sql}\n\nQuery returned {len(result_df)} rows. Data:\n{sample_data}"}
             ]
 
             insight_response = client_llm.chat.completions.create(
                 model="meta/llama-3.1-8b-instruct",
                 messages=insight_prompt,
                 temperature=0.3,
-                max_tokens=300
+                max_tokens=500
             )
             insight_text = insight_response.choices[0].message.content.strip()
         except Exception as insight_err:
-            # Non-fatal — fall back to basic count
+            logger.error(f"[MCP] Insight generation error: {insight_err}")
             insight_text = f"Found {len(result_df)} result(s)."
 
         return {
             "type": "data",
-            "sql": sql,
+            "sql": cleaned_sql,
             "data": result_df.fillna('').to_dict(orient="records"),
             "insight": insight_text
         }
