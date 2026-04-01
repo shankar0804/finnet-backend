@@ -53,7 +53,7 @@ SCHEMA = {
 }
 
 VALID_COLUMNS = set(SCHEMA["columns"].keys())
-VALID_OPS = {"=", "!=", ">", "<", ">=", "<=", "like"}
+VALID_OPS = {"=", "!=", ">", "<", ">=", "<=", "like", "is_null", "is_not_null"}
 
 
 def build_sql_from_spec(spec: dict) -> str:
@@ -79,6 +79,14 @@ def build_sql_from_spec(spec: dict) -> str:
             continue
 
         col_type = SCHEMA["columns"][col]
+
+        # Handle null/blank checks
+        if op == "is_null":
+            conditions.append(f"({col} IS NULL OR TRIM({col}) = '')")
+            continue
+        elif op == "is_not_null":
+            conditions.append(f"({col} IS NOT NULL AND TRIM({col}) != '')")
+            continue
 
         if op == "like":
             conditions.append(f"LOWER({col}) LIKE LOWER('%{val}%')")
@@ -116,45 +124,40 @@ def build_sql_from_spec(spec: dict) -> str:
     return sql
 
 
-SYSTEM_PROMPT = f"""You are a database query translator. Convert user questions into a JSON filter specification.
+SYSTEM_PROMPT = f"""You are an expert database query translator for an influencer talent agency. Convert ANY user question into a precise JSON filter specification that will be used to query a SQL database.
 
 **Database table: `influencers`**
-**Available columns (use ONLY these exact names):**
+**Available columns with types:**
 {json.dumps(SCHEMA["columns"], indent=2)}
 
-**Output format (JSON only, no markdown, no explanation):**
+**Available filter operators:**
+- `=` — exact match (for text, becomes case-insensitive LIKE)
+- `!=` — not equal
+- `>`, `<`, `>=`, `<=` — numeric comparisons
+- `like` — partial text match (case-insensitive)
+- `is_null` — column is empty, blank, or missing (no value needed)
+- `is_not_null` — column has a non-empty value (no value needed)
+
+**Output format (JSON only, NO markdown, NO explanation):**
 {{
-  "columns": ["*"] or ["column1", "column2"],
+  "columns": ["*"] or ["col1", "col2", ...],
   "filters": [
-    {{"column": "exact_column_name", "op": "=|!=|>|<|>=|<=|like", "value": "value"}}
+    {{"column": "exact_column_name", "op": "operator", "value": "value or null for is_null/is_not_null"}}
   ],
-  "sort": {{"column": "column_name", "direction": "ASC|DESC"}},
-  "limit": 50
+  "sort": {{"column": "column_name", "direction": "ASC|DESC"}} or null,
+  "limit": number
 }}
 
-**Rules:**
-- For text searches, always use op "like"
-- For numbers (followers, following_count, avg_views, posts_count, engagement_rate), use numeric operators
-- Output ONLY the JSON object, nothing else
-
-**Examples:**
-User: "Show me Harish's data"
-{{"columns": ["*"], "filters": [{{"column": "creator_name", "op": "like", "value": "harish"}}], "limit": 50}}
-
-User: "Find creators with more than 1M followers"
-{{"columns": ["username", "creator_name", "followers", "category"], "filters": [{{"column": "followers", "op": ">", "value": 1000000}}], "sort": {{"column": "followers", "direction": "DESC"}}, "limit": 50}}
-
-User: "Who has following less than 600"
-{{"columns": ["username", "creator_name", "followers", "following_count"], "filters": [{{"column": "following_count", "op": "<", "value": 600}}], "limit": 50}}
-
-User: "Show all tech creators"
-{{"columns": ["*"], "filters": [{{"column": "category", "op": "like", "value": "tech"}}], "limit": 50}}
-
-User: "Top 5 by engagement rate"
-{{"columns": ["username", "creator_name", "followers", "engagement_rate"], "filters": [], "sort": {{"column": "engagement_rate", "direction": "DESC"}}, "limit": 5}}
-
-User: "Show everyone"
-{{"columns": ["*"], "filters": [], "limit": 50}}"""
+**Critical Rules:**
+1. Use ONLY column names from the schema above. Never invent columns.
+2. For text searches use `like`. For numbers use numeric operators.
+3. For questions about missing/blank/empty data, use `is_null`. For questions about filled/complete data, use `is_not_null`.
+4. Select ONLY the columns relevant to the question. If the user asks about specific fields (niche, location, etc.), include those columns.
+5. When the user asks about "blank" or "missing" or "empty" fields for creators, filter WHERE those specific columns `is_null`.
+6. When the user asks "what data is missing" without specifying a field, select ALL columns so the answer can show which are blank.
+7. Think carefully about what the user is ACTUALLY asking. Translate their intent into the right filters.
+8. Default limit is 50. Use a smaller limit only if the user asks for a specific number (e.g. "top 5").
+9. Output ONLY valid JSON. No text before or after."""
 
 
 async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict:
@@ -209,21 +212,27 @@ async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict
         except sqlite3.Error as sql_err:
             return {"type": "error", "message": f"Query error: {sql_err}", "sql": sql}
 
-        # 6. Generate insight (skip for WhatsApp bot — it formats its own reply)
+        # 6. Generate insight — always provide a smart answer to the user's question
         insight_text = f"Found {len(result_df)} result(s)."
-        if not skip_insight:
+        try:
+            # Show more data to the LLM for better analysis
+            sample_data = result_df.head(20).to_json(orient='records')
+            
             insight_prompt = [
-                {"role": "system", "content": "You are a data analyst. Write 1-2 sentences summarizing the query results. Use <strong> for emphasis. No code blocks, no markdown, just plain text with HTML bold tags."},
-                {"role": "user", "content": f"Question: {user_query}\nResults ({len(result_df)} rows): {result_df.head(10).to_json(orient='records')}"}
+                {"role": "system", "content": "You are a helpful data analyst for an influencer agency. The user asked a question and we queried the database. Your job is to DIRECTLY ANSWER their question based on the results. Be specific and actionable. Use <strong> for emphasis. No code blocks, no markdown — just plain text with HTML bold tags. Keep it concise (2-4 sentences max)."},
+                {"role": "user", "content": f"User's question: \"{user_query}\"\n\nQuery returned {len(result_df)} rows. Data sample:\n{sample_data}"}
             ]
 
             insight_response = client_llm.chat.completions.create(
                 model="meta/llama-3.1-8b-instruct",
                 messages=insight_prompt,
                 temperature=0.3,
-                max_tokens=128
+                max_tokens=300
             )
             insight_text = insight_response.choices[0].message.content.strip()
+        except Exception as insight_err:
+            # Non-fatal — fall back to basic count
+            insight_text = f"Found {len(result_df)} result(s)."
 
         return {
             "type": "data",

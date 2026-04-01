@@ -273,21 +273,29 @@ function formatReply(data) {
         return `❌ *Error:* ${data?.message || 'Something went wrong.'}`;
     }
     let msg = '';
+
+    // Show AI insight as the PRIMARY answer
     if (data.insight) {
         const clean = data.insight.replace(/<strong>/gi, '*').replace(/<\/strong>/gi, '*').replace(/<[^>]+>/g, '');
         msg += `💡 ${clean}\n\n`;
     }
+
     if (data.data && data.data.length > 0) {
         const rows = data.data.slice(0, MAX_ROWS_IN_REPLY);
         const cols = Object.keys(rows[0]);
-        const priority = ['username', 'creator_name', 'followers', 'avg_views', 'engagement_rate', 'niche', 'location', 'platform'];
-        const display = priority.filter(c => cols.includes(c));
-        const final = display.length > 0 ? display : cols.slice(0, 4);
+
+        // Use the columns that the query actually returned (not a hardcoded list)
+        // Filter out internal/meta columns
+        const skipCols = ['id', 'profile_link', 'last_scraped_at', 'last_ocr_at', 'last_manual_at', 'created_at'];
+        const displayCols = cols.filter(c => !skipCols.includes(c));
+        // If too many columns, limit to the most useful ones
+        const maxCols = 6;
+        const finalCols = displayCols.length > maxCols ? displayCols.slice(0, maxCols) : displayCols;
 
         msg += `📊 *Results* (${data.data.length} found${data.data.length > MAX_ROWS_IN_REPLY ? `, top ${MAX_ROWS_IN_REPLY}` : ''}):\n\n`;
         rows.forEach((row, i) => {
             msg += `*${i + 1}. ${row.creator_name || row.username || 'Unknown'}*\n`;
-            final.forEach(col => {
+            finalCols.forEach(col => {
                 if (col === 'creator_name') return;
                 let val = row[col];
                 if (val === null || val === undefined || val === '') val = '-';
@@ -299,9 +307,11 @@ function formatReply(data) {
             });
             msg += '\n';
         });
-    } else {
+    } else if (!data.insight) {
+        // Only show 'no results' if there's no insight either
         msg += '📭 No results found.';
     }
+
     if (msg.length > MAX_MESSAGE_LENGTH) {
         msg = msg.slice(0, MAX_MESSAGE_LENGTH - 50) + '\n\n... _(use dashboard for full results)_';
     }
@@ -313,7 +323,7 @@ async function queryTrakr(query) {
         const res = await fetch(`${TRAKR_API_URL}/api/custom-search`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query, skip_insight: true }),
+            body: JSON.stringify({ query }),
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
@@ -418,53 +428,11 @@ async function startBot() {
                 if (!text) continue;
 
                 // ─── ACTIVATION CHECK ───
-                // Method 1: Direct mention (@finbotlocal / finbotlocal)
+                // Only activate on direct @mention in the message text
                 const mentionRe = new RegExp(`\\b${BOT_NAME}\\b`, 'i');
-                const mentionMatch = mentionRe.test(text);
+                if (!mentionRe.test(text)) continue;
 
-                // Method 2: Reply detection (to the bot, or to another tagged message)
-                const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
-                const quotedParticipant = contextInfo?.participant || '';
-                const botJid = sock.user?.id || '';
-                const botNumber = botJid.split(':')[0] || botJid.split('@')[0];
-                const botLid = sock.user?.lid || '';
-                const baseLid = botLid ? (botLid.split(':')[0] || botLid.split('@')[0]) : '';
-                
-                // Extract quoted text
-                let quotedText = '';
-                if (contextInfo?.quotedMessage) {
-                    quotedText = contextInfo.quotedMessage?.conversation
-                        || contextInfo.quotedMessage?.extendedTextMessage?.text
-                        || contextInfo.quotedMessage?.imageMessage?.caption
-                        || '';
-                }
-
-                // WhatsApp Multi-Device masks linked devices with @lid. We check phone number, lid, OR our known bot emojis.
-                const botEmojis = ['💡', '📊', '❌', '🤖', '📋', '📭', '👤', '✅'];
-                const isBotText = botEmojis.some(emoji => quotedText.trim().startsWith(emoji));
-
-                const isReplyToBot = !!(contextInfo?.quotedMessage && (
-                    quotedParticipant.includes(botNumber) || 
-                    (baseLid && quotedParticipant.includes(baseLid)) ||
-                    (quotedParticipant.includes('@lid') && isBotText)
-                ));
-
-                // If they replied to their own previous question containing the tag
-                const isReplyToTag = !!(quotedText && mentionRe.test(quotedText));
-
-                const isActivated = mentionMatch || isReplyToBot || isReplyToTag;
-
-                console.log(`\n--- DEBUG MESSAGE EVENT ---`);
-                console.log(`Text: "${text.substring(0,50)}"`);
-                console.log(`Quoted Participant: ${quotedParticipant}`);
-                console.log(`Bot Number: ${botNumber}`);
-                console.log(`Included? ${quotedParticipant.includes(botNumber)}`);
-                console.log(`isReplyToBot: ${isReplyToBot} | isReplyToTag: ${isReplyToTag}`);
-                console.log(`---------------------------\n`);
-
-                if (!isActivated) continue;
-
-                console.log(`📩 [ACTIVATED] mention=${mentionMatch} replyToBot=${isReplyToBot} replyToTag=${isReplyToTag}`);
+                console.log(`📩 [ACTIVATED] Direct @${BOT_NAME} mention detected`);
 
                 // ─── BUILD QUERY & CONTEXT ───
                 // Strip bot name from query
@@ -473,12 +441,7 @@ async function startBot() {
                     .replace(new RegExp(`\\b${BOT_NAME}\\b`, 'gi'), '')
                     .trim();
 
-                // Build conversation context from quoted message
                 let agentContext = null;
-                if (quotedText) {
-                    const ctxPrefix = isReplyToBot ? 'Previous bot reply' : 'Previous user question';
-                    agentContext = `${ctxPrefix}: "${quotedText.substring(0, 500)}"`;
-                }
 
                 // Also check for IG links in the full text and chat history
                 const igFromText = extractInstagramUsername(text);
@@ -684,7 +647,7 @@ console.log(`
 Bot trigger:  @${BOT_NAME}
 API server:   ${TRAKR_API_URL}
 Routing:      LLM-powered (agent.js)
-Activation:   @mention OR reply-to-bot
+Activation:   @mention only
 `);
 
 startBot().catch(err => {
