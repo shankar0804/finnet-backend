@@ -74,6 +74,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 <td>${renderEmpty(r.platform)}</td>
                 <td>${renderEmpty(r.niche)}</td>
                 <td>${renderEmpty(r.language)}</td>
+                <td>${renderEmpty(r.gender)}</td>
                 <td>${renderEmpty(r.location)}</td>
                 <td>${formatNumber(r.followers)}</td>
                 <td style="font-weight: 600;">${formatNumber(r.avg_views)}</td>

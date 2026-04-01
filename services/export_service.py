@@ -1,5 +1,7 @@
 """Google Sheets export via service account with domain-wide delegation."""
 import os
+import json
+import base64
 import logging
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -16,10 +18,32 @@ IMPERSONATE_USER = 'operations@finnetmedia.com'
 
 
 def _get_services():
-    """Returns authenticated Sheets and Drive service objects, impersonating a real user."""
-    creds = service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=SCOPES
-    )
+    """Returns authenticated Sheets and Drive service objects, impersonating a real user.
+    
+    Loads credentials from GOOGLE_SA_BASE64 env var (production) or
+    service_account.json file (local dev).
+    """
+    sa_b64 = os.environ.get('GOOGLE_SA_BASE64', '').strip()
+    
+    if sa_b64:
+        # Production: decode base64 env var → JSON dict → credentials
+        sa_info = json.loads(base64.b64decode(sa_b64).decode('utf-8'))
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info, scopes=SCOPES
+        )
+        logger.info("Loaded Google SA credentials from GOOGLE_SA_BASE64 env var")
+    elif os.path.exists(SERVICE_ACCOUNT_FILE):
+        # Local dev: load from file
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES
+        )
+        logger.info("Loaded Google SA credentials from service_account.json file")
+    else:
+        raise FileNotFoundError(
+            "No Google service account credentials found. "
+            "Set GOOGLE_SA_BASE64 env var or provide service_account.json"
+        )
+    
     # Impersonate the Workspace user so we use THEIR Drive storage
     creds = creds.with_subject(IMPERSONATE_USER)
     
@@ -56,6 +80,7 @@ def export_to_sheet(data: list[dict], title: str = "TRAKR AI Search Export") -> 
         ("Platform", "platform"),
         ("Niche", "niche"),
         ("Language", "language"),
+        ("Gender", "gender"),
         ("Location", "location"),
         ("Followers", "followers"),
         ("Avg Views", "avg_views"),
