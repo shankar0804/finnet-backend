@@ -443,6 +443,25 @@ async function startBot() {
 
                 let agentContext = null;
 
+                // ─── EXTRACT QUOTED/TAGGED MESSAGE CONTEXT ───
+                // When user replies to a message and tags @finbot, pull the quoted text as context
+                const contextInfo = msg.message?.extendedTextMessage?.contextInfo;
+                if (contextInfo?.quotedMessage) {
+                    const quoted = contextInfo.quotedMessage;
+                    const quotedText = quoted.conversation
+                        || quoted.extendedTextMessage?.text
+                        || quoted.imageMessage?.caption
+                        || quoted.videoMessage?.caption
+                        || '';
+                    if (quotedText) {
+                        // Truncate to avoid blowing up the LLM context window
+                        agentContext = quotedText.length > 1500
+                            ? quotedText.slice(0, 1500) + '...'
+                            : quotedText;
+                        console.log(`💬 [CONTEXT] Quoted message detected (${quotedText.length} chars)`);
+                    }
+                }
+
                 // Also check for IG links in the full text and chat history
                 const igFromText = extractInstagramUsername(text);
                 const historyContext = findContextFromHistory(jid);

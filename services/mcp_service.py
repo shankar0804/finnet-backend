@@ -58,6 +58,9 @@ VALID_OPS = {"=", "!=", ">", "<", ">=", "<=", "like", "is_null", "is_not_null"}
 
 def build_sql_from_spec(spec: dict) -> str:
     """Deterministically builds a safe SQL query from a validated JSON spec."""
+    import logging
+    logger = logging.getLogger(__name__)
+    
     columns = spec.get("columns", ["*"])
     if columns == ["*"] or not columns:
         col_str = "*"
@@ -67,7 +70,7 @@ def build_sql_from_spec(spec: dict) -> str:
 
     sql = f"SELECT {col_str} FROM influencers"
 
-    # Build WHERE clause
+    # Build WHERE conditions list (assembled into SQL later)
     filters = spec.get("filters", [])
     conditions = []
     for f in filters:
@@ -103,16 +106,24 @@ def build_sql_from_spec(spec: dict) -> str:
             else:
                 conditions.append(f"{col} {op} '{safe_val}'")
 
-    if conditions:
-        sql += " WHERE " + " AND ".join(conditions)
-
-    # ORDER BY
+    # ORDER BY — check sort BEFORE assembling WHERE, so we can add null filters
+    order_clause = ""
     sort = spec.get("sort")
     if sort:
         sort_col = sort.get("column", "")
         sort_dir = "DESC" if sort.get("direction", "").upper() == "DESC" else "ASC"
         if sort_col in VALID_COLUMNS:
-            sql += f" ORDER BY {sort_col} {sort_dir}"
+            # For numeric columns, filter out NULLs/0s so rows with no data don't pollute results
+            col_type = SCHEMA["columns"].get(sort_col, "text")
+            if col_type in ("integer", "real"):
+                conditions.append(f"({sort_col} IS NOT NULL AND {sort_col} > 0)")
+            order_clause = f" ORDER BY {sort_col} {sort_dir}"
+
+    # NOW assemble WHERE from all conditions (including sort-related null filters)
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+
+    sql += order_clause
 
     # LIMIT
     limit = spec.get("limit")
@@ -120,6 +131,9 @@ def build_sql_from_spec(spec: dict) -> str:
         sql += f" LIMIT {limit}"
     else:
         sql += " LIMIT 50"
+
+    logger.info(f"[MCP] Generated SQL: {sql}")
+    logger.info(f"[MCP] From spec: {json.dumps(spec)}")
 
     return sql
 
@@ -157,7 +171,30 @@ SYSTEM_PROMPT = f"""You are an expert database query translator for an influence
 6. When the user asks "what data is missing" without specifying a field, select ALL columns so the answer can show which are blank.
 7. Think carefully about what the user is ACTUALLY asking. Translate their intent into the right filters.
 8. Default limit is 50. Use a smaller limit only if the user asks for a specific number (e.g. "top 5").
-9. Output ONLY valid JSON. No text before or after."""
+9. Output ONLY valid JSON. No text before or after.
+10. For "lowest", "least", "minimum", "smallest" questions: use sort ASC with limit 1. Do NOT add numeric filters like < 0.
+11. For "highest", "most", "maximum", "largest", "top" questions: use sort DESC with limit 1 (or the number the user specifies).
+12. ALWAYS use sort + limit for superlative queries (best, worst, highest, lowest, etc.). NEVER guess a filter value.
+
+**Examples:**
+
+User: "who has the lowest followers"
+{{"columns": ["*"], "filters": [], "sort": {{"column": "followers", "direction": "ASC"}}, "limit": 1}}
+
+User: "lowest follower count person"
+{{"columns": ["*"], "filters": [], "sort": {{"column": "followers", "direction": "ASC"}}, "limit": 1}}
+
+User: "who has the most followers"
+{{"columns": ["*"], "filters": [], "sort": {{"column": "followers", "direction": "DESC"}}, "limit": 1}}
+
+User: "top 5 creators by followers"
+{{"columns": ["*"], "filters": [], "sort": {{"column": "followers", "direction": "DESC"}}, "limit": 5}}
+
+User: "who has the highest engagement rate"
+{{"columns": ["*"], "filters": [], "sort": {{"column": "engagement_rate", "direction": "DESC"}}, "limit": 1}}
+
+User: "show all creators"
+{{"columns": ["*"], "filters": [], "sort": null, "limit": 50}}"""
 
 
 async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict:
