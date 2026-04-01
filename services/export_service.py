@@ -27,7 +27,30 @@ def _get_services():
     
     if sa_b64:
         # Production: decode base64 env var → JSON dict → credentials
-        sa_info = json.loads(base64.b64decode(sa_b64).decode('utf-8'))
+        # Try base64 first, fall back to raw JSON
+        try:
+            decoded = base64.b64decode(sa_b64).decode('utf-8')
+        except Exception:
+            # Maybe it's raw JSON, not base64-encoded
+            decoded = sa_b64
+        
+        sa_info = json.loads(decoded)
+        
+        # Fix private key: env vars often store literal '\n' instead of real newlines
+        if 'private_key' in sa_info:
+            pk = sa_info['private_key']
+            # Replace literal two-char sequence '\\n' with actual newline
+            if '\\n' in pk and '\n' not in pk:
+                sa_info['private_key'] = pk.replace('\\n', '\n')
+            # Also handle case where it has a mix  
+            elif '\\n' in pk:
+                sa_info['private_key'] = pk.replace('\\n', '\n')
+            
+            # Diagnostic logging (safe — no key content revealed)
+            has_header = sa_info['private_key'].startswith('-----BEGIN')
+            has_newlines = '\n' in sa_info['private_key']
+            logger.info(f"Private key check: has_pem_header={has_header}, has_newlines={has_newlines}, length={len(sa_info['private_key'])}")
+        
         creds = service_account.Credentials.from_service_account_info(
             sa_info, scopes=SCOPES
         )
