@@ -220,7 +220,7 @@ async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict
         client_llm = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_KEY)
 
         llm_response = client_llm.chat.completions.create(
-            model="meta/llama-3.3-70b-instruct",
+            model="meta/llama-3.1-8b-instruct",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_query}

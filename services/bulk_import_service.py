@@ -300,6 +300,9 @@ def process_sheet(sheet_url: str = None, file_bytes: bytes = None,
     skipped_existing = []
     total = len(valid_rows)
 
+    # Mandatory fields required for NEW creators (not already in DB)
+    MANDATORY_FOR_NEW = {"niche", "language", "gender"}
+
     for i, row_data in enumerate(valid_rows):
         username = row_data["username"]
         name = row_data["name"]
@@ -312,43 +315,46 @@ def process_sheet(sheet_url: str = None, file_bytes: bytes = None,
 
         existing = existing_map.get(username)
 
-        # Check if creator exists and find which fields are missing in DB
         if existing:
-            missing_fields = {}
-            for field in ALL_SHEET_FIELDS:
-                db_val = existing.get(field)
-                sheet_val = manual_data.get(field)
-                if (not db_val or not str(db_val).strip()) and sheet_val:
-                    # DB is missing this field but sheet has it
-                    missing_fields[field] = sheet_val
+            # ── EXISTING CREATOR: always overwrite with sheet data ──
+            update_data = {}
+            for field, value in manual_data.items():
+                if value and str(value).strip():
+                    update_data[field] = str(value).strip()
 
-            if not missing_fields:
-                # Everything already filled — skip
+            if not update_data:
                 skipped_existing.append({
                     "row": row_num,
                     "name": name,
                     "username": username,
-                    "reason": "Already in DB with all fields filled"
+                    "reason": "Sheet has no updatable data for this creator"
                 })
                 continue
-            else:
-                # Fill only the missing fields from the sheet (no re-scrape needed)
-                manual_data = missing_fields
-                logger.info(f"[BULK] @{username} exists but missing: {list(missing_fields.keys())}")
-                # Just update the missing fields directly, no need to re-scrape
-                try:
-                    manual_data["last_manual_at"] = datetime.now(timezone.utc).isoformat()
-                    supabase.table("influencers").update(manual_data).eq("username", username).execute()
-                    imported.append({
-                        "row": row_num,
-                        "name": name,
-                        "username": username,
-                        "manual_fields_set": list(missing_fields.keys()),
-                    })
-                    logger.info(f"[BULK] ✅ @{username} updated missing fields: {list(missing_fields.keys())}")
-                except Exception as e:
-                    errors.append({"row": row_num, "name": name, "username": username, "reason": str(e)})
-                continue
+
+            try:
+                update_data["last_manual_at"] = datetime.now(timezone.utc).isoformat()
+                supabase.table("influencers").update(update_data).eq("username", username).execute()
+                imported.append({
+                    "row": row_num,
+                    "name": name,
+                    "username": username,
+                    "manual_fields_set": list(update_data.keys()),
+                })
+                logger.info(f"[BULK] ✅ @{username} updated fields: {list(update_data.keys())}")
+            except Exception as e:
+                errors.append({"row": row_num, "name": name, "username": username, "reason": str(e)})
+            continue
+
+        # ── NEW CREATOR: check mandatory fields first ──
+        missing_mandatory = [f for f in MANDATORY_FOR_NEW if f not in manual_data or not manual_data[f].strip()]
+        if missing_mandatory:
+            skipped_existing.append({
+                "row": row_num,
+                "name": name,
+                "username": username,
+                "reason": f"Missing mandatory fields: {', '.join(missing_mandatory)}. Please add them to the sheet."
+            })
+            continue
 
         # Scrape the profile
         try:
