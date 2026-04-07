@@ -166,6 +166,17 @@ def get_roster():
     except Exception as e:
         return jsonify({"error": "Supabase Connection error", "details": str(e)}), 500
 
+@api_bp.route('/roster/<username>', methods=['GET'])
+def get_influencer(username):
+    """Retrieve a single influencer by username."""
+    try:
+        resp = supabase.table("influencers").select("*").eq("username", username).execute()
+        if resp.data:
+            return jsonify(resp.data[0])
+        return jsonify({"error": "Not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @api_bp.route('/roster/<username>', methods=['DELETE'])
 def delete_influencer(username):
     try:

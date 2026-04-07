@@ -1001,11 +1001,38 @@ async function processScrapeForUser(sock, jid, msg, username, pending) {
 
     await sock.sendMessage(jid, { text: reply.trim() });
 
-    // Now ask for mandatory fields
-    pending.current = { username, step: 'awaiting_mandatory', data: {} };
-    await sock.sendMessage(jid, {
-        text: `📝 *Before I finalize @${username}, I need 3 details:*\n\nPlease reply with:\nLanguage: (e.g. Hindi)\nNiche: (e.g. Finance)\nGender: (e.g. Male)\n\n_Or in one line:_ Hindi, Finance, Male`
-    });
+    // Check if creator already exists in DB with mandatory fields filled
+    let needMandatory = true;
+    try {
+        const existingRes = await fetch(`${TRAKR_API_URL}/api/roster/${username}`);
+        if (existingRes.ok) {
+            const existing = await existingRes.json();
+            if (existing && existing.language && existing.niche && existing.gender) {
+                needMandatory = false;
+                console.log(`[SCRAPE] @${username} already has mandatory fields, skipping prompt`);
+                await sock.sendMessage(jid, {
+                    text: `@${username} already has all details in DB! Scrape data updated.`
+                });
+            }
+        }
+    } catch (e) {
+        console.error('[SCRAPE] Error checking existing creator:', e.message);
+    }
+
+    if (needMandatory) {
+        pending.current = { username, step: 'awaiting_mandatory', data: {} };
+        await sock.sendMessage(jid, {
+            text: `Before I finalize @${username}, I need 3 details:\n\nPlease reply with:\nLanguage: (e.g. Hindi)\nNiche: (e.g. Finance)\nGender: (e.g. Male)\n\nOr in one line: Hindi, Finance, Male`
+        });
+    } else {
+        // Skip mandatory, check if there's a next username in queue
+        const nextUsername = pending.queue.shift();
+        if (nextUsername) {
+            await processScrapeForUser(sock, jid, msg, nextUsername, pending);
+        } else {
+            pendingScrapes.delete(jid);
+        }
+    }
 }
 
 console.log(`
