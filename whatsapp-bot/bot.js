@@ -354,13 +354,8 @@ function formatReply(data) {
     }
     let msg = '';
 
-    // Show AI insight as the PRIMARY answer
-    if (data.insight) {
-        const clean = data.insight.replace(/<strong>/gi, '*').replace(/<\/strong>/gi, '*').replace(/<[^>]+>/g, '');
-        msg += `💡 ${clean}\n\n`;
-    }
-
-    if (data.data && data.data.length > 0) {
+    // Insight display removed - show data directly
+        if (data.data && data.data.length > 0) {
         const allRows = data.data;
 
         msg += `📊 *Results* (${allRows.length} found):\n\n`;
@@ -380,7 +375,7 @@ function formatReply(data) {
                 return;
             }
         });
-    } else if (!data.insight) {
+    } else {
         msg += '📭 No results found.';
     }
 

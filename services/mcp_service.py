@@ -83,7 +83,7 @@ def validate_sql(sql: str) -> tuple:
     dangerous_keywords = [
         'DROP', 'DELETE', 'INSERT', 'UPDATE', 'ALTER', 'CREATE',
         'TRUNCATE', 'EXEC', 'EXECUTE', 'GRANT', 'REVOKE', 'ATTACH',
-        'DETACH', 'PRAGMA', 'REPLACE', 'MERGE', 'CALL',
+        'DETACH', 'PRAGMA', 'MERGE', 'CALL',
     ]
     sql_upper = cleaned.upper()
     for kw in dangerous_keywords:
@@ -268,6 +268,7 @@ async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict
 
         # 5. Generate insight — smart answer to the user's question
         insight_text = f"Found {len(result_df)} result(s)."
+        '''
         try:
             sample_size = min(30, len(result_df))
             sample_data = result_df.head(sample_size).to_json(orient='records')
@@ -287,6 +288,7 @@ async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict
         except Exception as insight_err:
             logger.error(f"[MCP] Insight generation error: {insight_err}")
             insight_text = f"Found {len(result_df)} result(s)."
+        '''
 
         return {
             "type": "data",
