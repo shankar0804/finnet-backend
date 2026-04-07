@@ -74,16 +74,37 @@ def fetch_influencer_data(username: str) -> dict:
         
     target_reels = reels[:10]
     
-    # --- Avg Views with Outlier Removal ---
-    views = [r.get("videoViewCount", 0) for r in target_reels]
-    if len(views) > 2:
+    # --- Avg Views with IQR Outlier Removal ---
+    # Goal: Find the "typical" view range, ignoring viral spikes and dead posts
+    views = [r.get("videoViewCount", 0) for r in target_reels if r.get("videoViewCount", 0) > 0]
+    
+    if len(views) >= 4:
+        # IQR method: remove statistical outliers (both high and low)
         views_sorted = sorted(views)
-        valid_views = views_sorted[1:-1]  # Drop lowest and highest
+        n = len(views_sorted)
+        q1 = views_sorted[n // 4]           # 25th percentile
+        q3 = views_sorted[(3 * n) // 4]     # 75th percentile
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        valid_views = [v for v in views_sorted if lower_bound <= v <= upper_bound]
+        # Fallback: if IQR removes everything (all same value), use all
+        if not valid_views:
+            valid_views = views_sorted
+    elif len(views) > 2:
+        # Not enough for IQR, just drop highest and lowest
+        views_sorted = sorted(views)
+        valid_views = views_sorted[1:-1]
     else:
         valid_views = views
+    
     avg_views = (sum(valid_views) / len(valid_views)) if valid_views else 0
-    # Round to nearest 1000, but only if >= 1000 (prevents small creators showing 0)
-    if avg_views >= 1000:
+    # Round to nearest 50K for >= 50K, nearest 10K for >= 10K, nearest 1K otherwise
+    if avg_views >= 50000:
+        avg_views = round(avg_views / 50000) * 50000
+    elif avg_views >= 10000:
+        avg_views = round(avg_views / 10000) * 10000
+    elif avg_views >= 1000:
         avg_views = round(avg_views / 1000) * 1000
     else:
         avg_views = round(avg_views)

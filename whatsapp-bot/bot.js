@@ -131,6 +131,9 @@ function addToHistory(jid, msg) {
 // ─── Pending Scrape State Machine ───
 // Tracks per-chat scrape flows that need mandatory field input
 const pendingScrapes = new Map();
+
+// Track bulk import jobs: job_id -> { jid, msgKey }
+const bulkImportJobs = new Map();
 // Key: jid, Value: { queue: [{username, scraped}], current: {username, step, data}, sock }
 
 /**
@@ -275,43 +278,60 @@ async function processImage(msg, targetUsername) {
  * Fetch all roster data and export to Google Sheet.
  */
 async function exportToSheet(searchQuery) {
-    try {
-        let rows;
-        let title;
+    const MAX_RETRIES = 2;
 
-        if (searchQuery) {
-            const searchResult = await queryTrakr(searchQuery);
-            if (!searchResult || searchResult.type === 'error' || !searchResult.data?.length) {
-                return { success: false, error: 'No data found for that query.' };
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            let rows;
+            let title;
+
+            if (searchQuery) {
+                const searchResult = await queryTrakr(searchQuery);
+                if (!searchResult || searchResult.type === 'error' || !searchResult.data?.length) {
+                    return { success: false, error: 'No data found for that query.' };
+                }
+                rows = searchResult.data;
+                title = `TRAKR Export: ${searchQuery}`;
+            } else {
+                const controller1 = new AbortController();
+                const timeout1 = setTimeout(() => controller1.abort(), 30000);
+                const res = await fetch(`${TRAKR_API_URL}/api/roster`, { signal: controller1.signal });
+                clearTimeout(timeout1);
+                if (!res.ok) return { success: false, error: 'Failed to fetch roster data' };
+                const data = await res.json();
+                rows = data;
+                title = `TRAKR Full Roster Export`;
             }
-            rows = searchResult.data;
-            title = `TRAKR Export: ${searchQuery}`;
-        } else {
-            const res = await fetch(`${TRAKR_API_URL}/api/roster`);
-            if (!res.ok) return { success: false, error: 'Failed to fetch roster data' };
-            const data = await res.json();
-            rows = data;
-            title = `TRAKR Full Roster Export`;
+
+            if (!rows || rows.length === 0) {
+                return { success: false, error: 'No data to export.' };
+            }
+
+            // Export with 60s timeout (Google Sheets API can be slow)
+            const controller2 = new AbortController();
+            const timeout2 = setTimeout(() => controller2.abort(), 60000);
+            const exportRes = await fetch(`${TRAKR_API_URL}/api/export-to-sheet`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ data: rows, title }),
+                signal: controller2.signal,
+            });
+            clearTimeout(timeout2);
+
+            const exportData = await exportRes.json();
+            if (!exportRes.ok) {
+                throw new Error(exportData.error || 'Export failed');
+            }
+
+            return { success: true, url: exportData.sheet_url, count: rows.length };
+        } catch (err) {
+            console.error(`[EXPORT] Attempt ${attempt}/${MAX_RETRIES} failed: ${err.message}`);
+            if (attempt === MAX_RETRIES) {
+                return { success: false, error: `Export failed after ${MAX_RETRIES} attempts: ${err.message}` };
+            }
+            // Wait 2s before retry
+            await new Promise(r => setTimeout(r, 2000));
         }
-
-        if (!rows || rows.length === 0) {
-            return { success: false, error: 'No data to export.' };
-        }
-
-        const exportRes = await fetch(`${TRAKR_API_URL}/api/export-to-sheet`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ data: rows, title }),
-        });
-
-        const exportData = await exportRes.json();
-        if (!exportRes.ok) {
-            return { success: false, error: exportData.error || 'Export failed' };
-        }
-
-        return { success: true, url: exportData.sheet_url, count: rows.length };
-    } catch (err) {
-        return { success: false, error: err.message };
     }
 }
 
@@ -422,6 +442,7 @@ async function startBot() {
         generateHighQualityLinkPreview: false,
     });
 
+    let reconnectAttempt = 0;
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         if (qr) {
@@ -443,8 +464,14 @@ async function startBot() {
             const retry = code !== DisconnectReason.loggedOut;
             console.log(`❌ Closed (${code}). ${retry ? 'Reconnecting...' : 'Logged out. Clearing session...'}`);
             if (retry) {
+                reconnectAttempt++;
+                // Exponential backoff: conflict/timeout waits longer
+                const isConflict = code === 440 || code === 408 || code === 500 || code === 503;
+                const baseDelay = isConflict ? 5000 : 2000;
+                const delay = Math.min(baseDelay * Math.pow(1.5, reconnectAttempt - 1), 30000);
+                console.log(`Waiting ${(delay/1000).toFixed(1)}s before reconnect (attempt ${reconnectAttempt})...`);
                 botState = { state: 'reconnecting', qr: null, qrBase64: null, phone: null };
-                startBot();
+                setTimeout(() => startBot(), delay);
             } else {
                 botState = { state: 'logged_out', qr: null, qrBase64: null, phone: null };
                 // Clear session based on auth mode
@@ -465,6 +492,7 @@ async function startBot() {
             }
         }
         if (connection === 'open') {
+            reconnectAttempt = 0;
             const phoneNumber = sock.user?.id?.split(':')[0] || sock.user?.id?.split('@')[0] || null;
             botState = { state: 'connected', qr: null, qrBase64: null, phone: phoneNumber };
             console.log('✅ WhatsApp connected! Bot is live.');
@@ -474,6 +502,7 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
+    _botSocket = sock;
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
@@ -683,16 +712,23 @@ async function startBot() {
                 // ═══════════════════════════════════════════
                 if (intent.action === 'greeting') {
                     const prefix = isDM ? '' : `@${BOT_NAME} `;
-                    const greetingText = intent.greeting_response || 
+                    const greetingText = 
                         `🤖 *Yo! I'm FinBot — your influencer intel assistant.*\n\n` +
-                        `🔍 *Ask me anything:*\n` +
+                        `🔍 *Search Database:*\n` +
                         `• _${prefix}show all creators_\n` +
-                        `• _${prefix}who has the most followers?_\n\n` +
-                        `📸 *Feed me data:*\n` +
-                        `• Drop an IG link + _${prefix}update_\n\n` +
+                        `• _${prefix}who has the most followers?_\n` +
+                        `• _${prefix}beauty creators in Mumbai_\n\n` +
+                        `📸 *Add Creators:*\n` +
+                        `• _${prefix}add_ + IG link(s)\n` +
+                        `• _${prefix}put in the db_ + IG link(s)\n\n` +
+                        `✏️ *Update Data:*\n` +
+                        `• IG link + _managed by Rahul_\n` +
+                        `• IG link + _update details_\n\n` +
+                        `📥 *Bulk Import:*\n` +
+                        `• Google Sheets link + _import_\n\n` +
                         `📊 *Export:*\n` +
                         `• _${prefix}export to sheet_\n\n` +
-                        `_Just reply to any of my messages to follow up!_ 💬`;
+                        `_Reply to any of my messages to follow up!_ 💬`;
                     await sock.sendMessage(jid, { text: greetingText }, { quoted: msg });
                     await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
                     continue;
@@ -824,6 +860,76 @@ async function startBot() {
                 }
 
                 // ═══════════════════════════════════════════
+                // ACTION: BULK_IMPORT (async background processing)
+                // ═══════════════════════════════════════════
+                if (intent.action === 'bulk_import') {
+                    let sheetUrl = intent.sheet_url;
+                    if (!sheetUrl) {
+                        const sheetMatch = text.match(/https?:\/\/docs\.google\.com\/spreadsheets\/d\/[a-zA-Z0-9_-]+[^\s]*/i);
+                        if (sheetMatch) sheetUrl = sheetMatch[0];
+                    }
+
+                    if (!sheetUrl) {
+                        await sock.sendMessage(jid, {
+                            text: '\u274c I could not find a valid Google Sheet link. Please send a link like:\nhttps://docs.google.com/spreadsheets/d/...'
+                        }, { quoted: msg });
+                        await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
+                        continue;
+                    }
+
+                    try {
+                        const importRes = await fetch(`${TRAKR_API_URL}/api/bulk-import`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                sheet_url: sheetUrl,
+                                callback_url: 'http://127.0.0.1:3002/bulk-callback',
+                            }),
+                        });
+                        const startResult = await importRes.json();
+
+                        if (startResult.error) {
+                            await sock.sendMessage(jid, {
+                                text: `\u274c *Import Failed:* ${startResult.error}`
+                            }, { quoted: msg });
+                        } else {
+                            bulkImportJobs.set(startResult.job_id, { jid, msgKey: msg.key });
+                            await sock.sendMessage(jid, {
+                                text: `\ud83d\udccb *Bulk Import Started!*\n\n\ud83d\udd17 Processing sheet in background...\n\u23f3 I will send progress updates. Other queries keep working!\n\n_Job: ${startResult.job_id}_`
+                            }, { quoted: msg });
+                        }
+                    } catch (importErr) {
+                        await sock.sendMessage(jid, {
+                            text: `\u274c Import failed: ${importErr.message}`
+                        }, { quoted: msg });
+                    }
+
+                    await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
+                    continue;
+                }
+
+                // ─── SAFETY NET: Override search to scrape if IG links + action words present ───
+                if (intent.action === 'search' && allIgUsernames.length > 0) {
+                    const scrapeKeywords = /\b(add|put|store|save|scrape|fetch|database|db)\b/i;
+                    if (scrapeKeywords.test(text)) {
+                        console.log('[OVERRIDE] LLM said search but text has IG links + action words -> scrape');
+                        intent.action = 'scrape';
+                        intent.instagram_username = allIgUsernames[0];
+                        let usernames = allIgUsernames;
+                        if (usernames.length > 1) {
+                            await sock.sendMessage(jid, {
+                                text: `Found ${usernames.length} Instagram profiles! Processing one by one.\n\n${usernames.map((u, i) => `${i + 1}. @${u}`).join('\n')}`
+                            }, { quoted: msg });
+                        }
+                        const pending = { queue: usernames.slice(1), current: null };
+                        pendingScrapes.set(jid, pending);
+                        await processScrapeForUser(sock, jid, msg, usernames[0], pending);
+                        await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
+                        continue;
+                    }
+                }
+
+                // ═══════════════════════════════════════════
                 // ACTION: SEARCH (default)
                 // ═══════════════════════════════════════════
                 const searchQuery = intent.query || query;
@@ -917,6 +1023,80 @@ API server:   ${TRAKR_API_URL}
 Routing:      LLM-powered (agent.js)
 Activation:   @mention (groups) + all DMs
 `);
+
+
+// ─── Bulk Import Webhook Server (port 3002) ───────────────────
+// Receives progress updates and final reports from Flask background threads
+let _botSocket = null;
+
+function startWebhookServer() {
+    const server = http.createServer(async (req, res) => {
+        if (req.method === 'POST' && req.url === '/bulk-callback') {
+            let body = '';
+            req.on('data', chunk => body += chunk);
+            req.on('end', async () => {
+                try {
+                    const data = JSON.parse(body);
+                    const job = bulkImportJobs.get(data.job_id);
+
+                    if (!job || !_botSocket) {
+                        res.writeHead(404);
+                        res.end('Job not found');
+                        return;
+                    }
+
+                    if (data.type === 'progress') {
+                        await _botSocket.sendMessage(job.jid, { text: data.message });
+                    } else if (data.type === 'complete') {
+                        const report = data.report;
+                        let reportMsg = 'Bulk Import Report\n\n';
+                        reportMsg += 'Total rows: ' + (report.total_rows || 0) + '\n';
+                        reportMsg += 'Imported: ' + (report.imported || 0) + '\n';
+                        reportMsg += 'Skipped: ' + (report.skipped ? report.skipped.length : 0) + '\n';
+                        reportMsg += 'Errors: ' + (report.errors ? report.errors.length : 0) + '\n';
+
+                        if (report.skipped && report.skipped.length > 0) {
+                            reportMsg += '\nSkipped Rows:\n';
+                            for (const s of report.skipped.slice(0, 15)) {
+                                reportMsg += '  Row ' + s.row + ': ' + s.name + ' - ' + s.reason + '\n';
+                            }
+                        }
+
+                        if (report.errors && report.errors.length > 0) {
+                            reportMsg += '\nErrors:\n';
+                            for (const e of report.errors.slice(0, 10)) {
+                                reportMsg += '  @' + e.username + ': ' + e.reason + '\n';
+                            }
+                        }
+
+                        if (report.error) {
+                            reportMsg = 'Import Failed: ' + report.error;
+                        }
+
+                        await _botSocket.sendMessage(job.jid, { text: reportMsg.trim() });
+                        bulkImportJobs.delete(data.job_id);
+                    }
+
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: true }));
+                } catch (err) {
+                    console.error('[WEBHOOK] Error:', err);
+                    res.writeHead(500);
+                    res.end('Error');
+                }
+            });
+        } else {
+            res.writeHead(404);
+            res.end('Not found');
+        }
+    });
+
+    server.listen(3002, '127.0.0.1', () => {
+        console.log('Bulk import webhook server listening on port 3002');
+    });
+}
+
+startWebhookServer();
 
 startBot().catch(err => {
     console.error('Fatal:', err);

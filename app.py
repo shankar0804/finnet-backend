@@ -101,5 +101,17 @@ atexit.register(stop_whatsapp_bot)
 
 if __name__ == '__main__':
     start_whatsapp_bot()
-    # Start massive dashboard server
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    port = int(os.environ.get('PORT', 5000))
+    
+    # Use waitress (production WSGI server) with 8 threads for concurrency
+    # This allows multiple users to query simultaneously without blocking
+    use_dev = os.environ.get('FLASK_ENV') == 'development' or '--dev' in sys.argv
+    
+    if use_dev:
+        logger.info("🚧 Starting Flask DEV server (single-threaded) on port %s", port)
+        app.run(host='0.0.0.0', port=port, debug=True)
+    else:
+        from waitress import serve
+        logger.info("🚀 Starting Waitress PRODUCTION server (8 threads) on port %s", port)
+        serve(app, host='0.0.0.0', port=port, threads=8)
+

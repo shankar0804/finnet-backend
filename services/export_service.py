@@ -84,11 +84,27 @@ def export_to_sheet(data: list[dict], title: str = "TRAKR AI Search Export") -> 
     """
     Creates a new Google Sheet with the given data and shares it as 'anyone with link can edit'.
     Returns {"sheet_id": ..., "sheet_url": ...}.
+    Retries once on failure (Google API can be flaky).
     """
     if not data:
         raise ValueError("No data to export.")
 
-    sheets_svc, drive_svc = _get_services()
+    import time
+    last_error = None
+    for attempt in range(2):  # 2 attempts
+        try:
+            sheets_svc, drive_svc = _get_services()
+            return _do_export(sheets_svc, drive_svc, data, title)
+        except Exception as e:
+            last_error = e
+            logger.warning(f"[EXPORT] Attempt {attempt+1}/2 failed: {e}")
+            if attempt == 0:
+                time.sleep(3)  # Wait 3s before retry
+    raise last_error
+
+
+def _do_export(sheets_svc, drive_svc, data, title):
+    """Internal: creates sheet, writes data, shares it."""
 
     # 1. Create new spreadsheet
     spreadsheet = sheets_svc.spreadsheets().create(

@@ -198,32 +198,130 @@ def export_to_sheet():
 
 @api_bp.route('/update-field', methods=['POST'])
 def update_field():
-    """Allows updating a specific database column for a creator from the LLM agent."""
+    """Allows updating manual/editable database columns for a creator from the LLM agent.
+    Only manual fields can be updated via this endpoint. Auto-scraped fields (followers, avg_views etc.) are read-only.
+    An Instagram username (link) is ALWAYS required.
+    """
     try:
         data = request.get_json(silent=True) or {}
         username = data.get('username')
         field = data.get('field')
         value = data.get('value')
-        
-        if not username or not field:
-            return jsonify({"error": "Missing username or field"}), 400
-            
-        from services.mcp_service import VALID_COLUMNS
-        if field not in VALID_COLUMNS:
-            return jsonify({"error": f"Invalid field '{field}'. Valid fields are: {', '.join(VALID_COLUMNS)}"}), 400
-            
+
+        if not username:
+            return jsonify({"error": "An Instagram link or username is required to update a field. Please provide the creator's profile link."}), 400
+
+        if not field:
+            return jsonify({"error": "Missing field name to update."}), 400
+
+        # Only these manual fields are allowed to be updated via the bot
+        MANUAL_FIELDS = {
+            'managed_by', 'niche', 'language', 'gender', 'location',
+            'mail_id', 'contact_numbers', 'last_manual_at'
+        }
+
+        if field not in MANUAL_FIELDS:
+            return jsonify({
+                "error": f"The field '{field}' cannot be updated manually. Only these fields can be edited: {', '.join(sorted(MANUAL_FIELDS))}"
+            }), 400
+
         # Execute update
-        update_data = {field: value}
+        from datetime import datetime, timezone
+
+        # Special handling for niche: APPEND instead of replace
+        final_value = value
+        if field == 'niche' and value:
+            # Fetch existing niche
+            existing = supabase.table("influencers").select("niche").eq("username", username).execute()
+            if existing.data and existing.data[0].get("niche"):
+                current_niches = [n.strip() for n in existing.data[0]["niche"].split(",") if n.strip()]
+                new_niche = value.strip()
+                # Only append if not already present (case-insensitive)
+                if new_niche.lower() not in [n.lower() for n in current_niches]:
+                    current_niches.append(new_niche)
+                    final_value = ", ".join(current_niches)
+                else:
+                    final_value = existing.data[0]["niche"]  # Already has it
+
+        update_data = {
+            field: final_value,
+            "last_manual_at": datetime.now(timezone.utc).isoformat()
+        }
         response = supabase.table("influencers").update(update_data).eq("username", username).execute()
-        
+
         if len(response.data) == 0:
-             return jsonify({"error": f"Creator @{username} not found in database"}), 404
-             
+             return jsonify({"error": f"Creator @{username} not found in database. Make sure the profile is scraped first."}), 404
+
         return jsonify({
-            "success": True, 
-            "message": f"Updated `{field}` to `{value}` for @{username}",
+            "success": True,
+            "message": f"Updated `{field}` to `{final_value}` for @{username}",
             "data": response.data[0]
         })
     except Exception as e:
         logger.error(f"API /update-field Error: {traceback.format_exc()}")
         return jsonify({"error": "Update failed", "details": str(e)}), 500
+
+@api_bp.route('/bulk-import', methods=['POST'])
+def bulk_import():
+    """Bulk import influencers from a Google Sheet URL.
+    Runs in a background thread so other requests aren't blocked.
+    Sends progress updates and final report to callback_url if provided.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        sheet_url = data.get('sheet_url')
+        callback_url = data.get('callback_url')  # Bot's webhook to receive updates
+
+        if not sheet_url:
+            return jsonify({'error': 'Missing sheet_url parameter.'}), 400
+
+        import threading
+        import uuid
+        import requests as http_req
+
+        job_id = str(uuid.uuid4())[:8]
+
+        def run_import():
+            """Background worker — processes the sheet and sends updates."""
+            from services.bulk_import_service import process_sheet
+
+            def send_progress(msg):
+                """Send progress update to bot via callback."""
+                if callback_url:
+                    try:
+                        http_req.post(callback_url, json={
+                            'job_id': job_id,
+                            'type': 'progress',
+                            'message': msg
+                        }, timeout=5)
+                    except Exception:
+                        pass
+
+            report = process_sheet(sheet_url=sheet_url, progress_callback=send_progress)
+
+            # Send final report to bot
+            if callback_url:
+                try:
+                    http_req.post(callback_url, json={
+                        'job_id': job_id,
+                        'type': 'complete',
+                        'report': report
+                    }, timeout=10)
+                except Exception as e:
+                    logger.error(f"[BULK] Failed to send report to callback: {e}")
+
+        # Start background thread and return immediately
+        thread = threading.Thread(target=run_import, daemon=True)
+        thread.start()
+
+        logger.info(f"[BULK] Job {job_id} started in background for sheet: {sheet_url}")
+        return jsonify({
+            'status': 'processing',
+            'job_id': job_id,
+            'message': 'Import started in background. You will receive updates.'
+        })
+
+    except Exception as e:
+        logger.error(f'API /bulk-import Error: {traceback.format_exc()}')
+        return jsonify({'error': 'Bulk import failed', 'details': str(e)}), 500
+
