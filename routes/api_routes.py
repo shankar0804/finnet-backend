@@ -354,48 +354,63 @@ def auth_login_password():
 
 
 @api_bp.route('/users/create', methods=['POST'])
-@require_admin
-def create_external_user(current_user=None):
-    """Admin-only: create an external employee account with username/password."""
+@require_auth
+def create_user(current_user=None):
+    """Create a new user account.
+    - Brand account (with password): admin or senior can create
+    - Internal account (no password, Google): admin only
+    """
     try:
         data = request.get_json(silent=True) or {}
         email = (data.get('email') or '').strip().lower()
-        name = (data.get('name') or '').strip()
-        password = data.get('password', '')
+        password = data.get('password', '').strip()
         role = (data.get('role') or 'junior').strip().lower()
+        caller_role = current_user.get('role', 'junior')
 
-        if not email or not password:
-            return jsonify({"error": "Email and password are required"}), 400
-
-        if len(password) < 6:
-            return jsonify({"error": "Password must be at least 6 characters"}), 400
+        if not email:
+            return jsonify({"error": "Email is required"}), 400
 
         if role not in ('junior', 'senior'):
             role = 'junior'
+
+        # Permission check
+        is_brand = bool(password)
+        if is_brand:
+            # Brand account → admin or senior can create
+            if caller_role not in ('admin', 'senior'):
+                return jsonify({"error": "Only admin or senior members can create brand accounts"}), 403
+            if len(password) < 6:
+                return jsonify({"error": "Password must be at least 6 characters"}), 400
+        else:
+            # Internal (Google) account → admin only
+            if caller_role != 'admin':
+                return jsonify({"error": "Only admin can create internal employee accounts"}), 403
 
         # Check if user already exists
         existing = supabase.table("app_users").select("email").eq("email", email).execute()
         if existing.data and len(existing.data) > 0:
             return jsonify({"error": f"User {email} already exists"}), 409
 
-        # Hash password
-        password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
         now = datetime.now(timezone.utc).isoformat()
-        supabase.table("app_users").insert({
+        user_data = {
             "email": email,
-            "name": name or email.split('@')[0],
+            "name": email.split('@')[0],
             "role": role,
-            "auth_method": "password",
-            "password_hash": password_hash,
+            "auth_method": "password" if is_brand else "google",
             "created_at": now,
             "updated_at": now
-        }).execute()
+        }
 
-        audit_log('INSERT', 'app_users', email, {'role': role, 'auth_method': 'password'}, source='dashboard')
+        if is_brand:
+            user_data["password_hash"] = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
-        logger.info(f"[AUTH] External user created: {email} (role: {role})")
-        return jsonify({"success": True, "email": email, "role": role})
+        supabase.table("app_users").insert(user_data).execute()
+
+        auth_type = 'brand' if is_brand else 'internal'
+        audit_log('INSERT', 'app_users', email, {'role': role, 'type': auth_type}, source='dashboard')
+
+        logger.info(f"[AUTH] User created by {current_user.get('email')}: {email} (role: {role}, type: {auth_type})")
+        return jsonify({"success": True, "email": email, "role": role, "type": auth_type})
 
     except Exception as e:
         logger.error(f"API /users/create Error: {e}")
@@ -403,9 +418,11 @@ def create_external_user(current_user=None):
 
 
 @api_bp.route('/users', methods=['GET'])
-@require_admin
+@require_auth
 def list_users(current_user=None):
-    """Admin-only: list all app users and their roles."""
+    """Admin/Senior: list all app users and their roles."""
+    if current_user.get('role') not in ('admin', 'senior'):
+        return jsonify({"error": "Access denied"}), 403
     try:
         resp = supabase.table("app_users").select("*").order("created_at", desc=True).execute()
         return jsonify(resp.data)
