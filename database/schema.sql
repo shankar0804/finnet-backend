@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS app_users (
     email VARCHAR(255) PRIMARY KEY,
     name VARCHAR(255) DEFAULT '',
     picture TEXT DEFAULT '',
-    role VARCHAR(20) DEFAULT 'junior' CHECK (role IN ('admin', 'senior', 'junior')),
+    role VARCHAR(20) DEFAULT 'junior' CHECK (role IN ('admin', 'senior', 'junior', 'brand')),
     auth_method VARCHAR(20) DEFAULT 'google' CHECK (auth_method IN ('google', 'password')),
     password_hash TEXT DEFAULT '',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),

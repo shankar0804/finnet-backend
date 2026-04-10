@@ -40,6 +40,10 @@ Run this SQL in **Supabase SQL Editor** if the table doesn't exist:
 ALTER TABLE app_users ADD COLUMN IF NOT EXISTS auth_method VARCHAR(20) DEFAULT 'google';
 ALTER TABLE app_users ADD COLUMN IF NOT EXISTS password_hash TEXT DEFAULT '';
 
+-- Update role constraint to include 'brand':
+ALTER TABLE app_users DROP CONSTRAINT IF EXISTS app_users_role_check;
+ALTER TABLE app_users ADD CONSTRAINT app_users_role_check CHECK (role IN ('admin', 'senior', 'junior', 'brand'));
+
 -- If it doesn't exist yet, full creation:
 CREATE TABLE IF NOT EXISTS app_users (
     email VARCHAR(255) PRIMARY KEY,

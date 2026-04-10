@@ -370,21 +370,21 @@ def create_user(current_user=None):
         if not email:
             return jsonify({"error": "Email is required"}), 400
 
-        if role not in ('junior', 'senior'):
-            role = 'junior'
-
         # Permission check
         is_brand = bool(password)
         if is_brand:
-            # Brand account → admin or senior can create
+            # Brand account → admin or senior can create, role is always 'brand'
             if caller_role not in ('admin', 'senior'):
                 return jsonify({"error": "Only admin or senior members can create brand accounts"}), 403
             if len(password) < 6:
                 return jsonify({"error": "Password must be at least 6 characters"}), 400
+            role = 'brand'  # Always brand role
         else:
             # Internal (Google) account → admin only
             if caller_role != 'admin':
                 return jsonify({"error": "Only admin can create internal employee accounts"}), 403
+            if role not in ('junior', 'senior'):
+                role = 'junior'
 
         # Check if user already exists
         existing = supabase.table("app_users").select("email").eq("email", email).execute()
