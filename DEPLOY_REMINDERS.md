@@ -86,4 +86,59 @@ CREATE POLICY "anon_insert" ON audit_logs FOR INSERT WITH CHECK (true);
 
 ---
 
+## Supabase: Brand Management Tables (NEW)
+
+Run this SQL to create the partnership/campaign/entry tables:
+
+```sql
+-- Partnerships
+CREATE TABLE IF NOT EXISTS partnerships (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    brand_name VARCHAR(255) NOT NULL,
+    contact_email VARCHAR(255) DEFAULT '',
+    status VARCHAR(20) DEFAULT 'active' CHECK (status IN ('active', 'completed', 'paused')),
+    notes TEXT DEFAULT '',
+    created_by VARCHAR(255) DEFAULT '',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+ALTER TABLE partnerships ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "anon_all_partnerships" ON partnerships FOR ALL USING (true) WITH CHECK (true);
+
+-- Campaigns
+CREATE TABLE IF NOT EXISTS campaigns (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    partnership_id UUID NOT NULL REFERENCES partnerships(id) ON DELETE CASCADE,
+    campaign_name VARCHAR(255) NOT NULL,
+    platform VARCHAR(50) DEFAULT 'Instagram',
+    status VARCHAR(20) DEFAULT 'draft' CHECK (status IN ('draft', 'active', 'completed')),
+    start_date DATE,
+    end_date DATE,
+    budget DECIMAL(12,2) DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_campaigns_partnership ON campaigns (partnership_id);
+ALTER TABLE campaigns ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "anon_all_campaigns" ON campaigns FOR ALL USING (true) WITH CHECK (true);
+
+-- Campaign Entries
+CREATE TABLE IF NOT EXISTS campaign_entries (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    campaign_id UUID NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+    creator_username VARCHAR(255) NOT NULL,
+    deliverable_type VARCHAR(50) DEFAULT 'Reel' CHECK (deliverable_type IN ('Reel', 'Story', 'Post', 'Video', 'Other')),
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'in_progress', 'delivered', 'approved')),
+    content_link TEXT DEFAULT '',
+    notes TEXT DEFAULT '',
+    amount DECIMAL(10,2) DEFAULT 0,
+    delivery_date DATE,
+    poc VARCHAR(255) DEFAULT '',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_entries_campaign ON campaign_entries (campaign_id);
+ALTER TABLE campaign_entries ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "anon_all_entries" ON campaign_entries FOR ALL USING (true) WITH CHECK (true);
+```
+
+---
+
 > Delete this file once all steps are completed.

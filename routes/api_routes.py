@@ -668,3 +668,235 @@ def get_audit_logs(current_user=None):
         return jsonify(resp.data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+# BRAND MANAGEMENT — Partnerships / Campaigns / Entries
+# ═══════════════════════════════════════════════════════════
+
+# ─── Partnerships ───
+
+@api_bp.route('/partnerships', methods=['GET'])
+@require_auth
+def list_partnerships(current_user=None):
+    """List all partnerships. Brand users see only their own."""
+    try:
+        query = supabase.table('partnerships').select('*').order('created_at', desc=True)
+        if current_user.get('role') == 'brand':
+            query = query.eq('contact_email', current_user.get('email', ''))
+        resp = query.execute()
+        # Add campaign count for each partnership
+        for p in resp.data:
+            camp = supabase.table('campaigns').select('id', count='exact').eq('partnership_id', p['id']).execute()
+            p['campaign_count'] = camp.count if hasattr(camp, 'count') and camp.count is not None else len(camp.data)
+        return jsonify(resp.data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/partnerships', methods=['POST'])
+@require_auth
+def create_partnership(current_user=None):
+    """Create a new partnership. Admin/Senior only."""
+    if current_user.get('role') not in ('admin', 'senior'):
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        data = request.get_json(silent=True) or {}
+        brand_name = (data.get('brand_name') or '').strip()
+        if not brand_name:
+            return jsonify({'error': 'Brand name is required'}), 400
+        row = {
+            'brand_name': brand_name,
+            'contact_email': (data.get('contact_email') or '').strip().lower(),
+            'status': data.get('status', 'active'),
+            'notes': data.get('notes', ''),
+            'created_by': current_user.get('email', ''),
+        }
+        resp = supabase.table('partnerships').insert(row).execute()
+        audit_log('INSERT', 'partnerships', brand_name, row, source='dashboard')
+        return jsonify(resp.data[0] if resp.data else {'success': True}), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/partnerships/<pid>', methods=['PUT'])
+@require_auth
+def update_partnership(pid, current_user=None):
+    if current_user.get('role') not in ('admin', 'senior'):
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        data = request.get_json(silent=True) or {}
+        allowed = ['brand_name', 'contact_email', 'status', 'notes']
+        updates = {k: data[k] for k in allowed if k in data}
+        if not updates:
+            return jsonify({'error': 'Nothing to update'}), 400
+        resp = supabase.table('partnerships').update(updates).eq('id', pid).execute()
+        audit_log('UPDATE', 'partnerships', pid, updates, source='dashboard')
+        return jsonify(resp.data[0] if resp.data else {'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/partnerships/<pid>', methods=['DELETE'])
+@require_admin
+def delete_partnership(pid, current_user=None):
+    try:
+        supabase.table('partnerships').delete().eq('id', pid).execute()
+        audit_log('DELETE', 'partnerships', pid, {}, source='dashboard')
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── Campaigns ───
+
+@api_bp.route('/partnerships/<pid>/campaigns', methods=['GET'])
+@require_auth
+def list_campaigns(pid, current_user=None):
+    try:
+        resp = supabase.table('campaigns').select('*').eq('partnership_id', pid).order('created_at', desc=True).execute()
+        # Add entry count
+        for c in resp.data:
+            ent = supabase.table('campaign_entries').select('id', count='exact').eq('campaign_id', c['id']).execute()
+            c['entry_count'] = ent.count if hasattr(ent, 'count') and ent.count is not None else len(ent.data)
+        return jsonify(resp.data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/campaigns', methods=['POST'])
+@require_auth
+def create_campaign(current_user=None):
+    if current_user.get('role') not in ('admin', 'senior'):
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        data = request.get_json(silent=True) or {}
+        name = (data.get('campaign_name') or '').strip()
+        pid = data.get('partnership_id', '')
+        if not name or not pid:
+            return jsonify({'error': 'Campaign name and partnership_id are required'}), 400
+        row = {
+            'partnership_id': pid,
+            'campaign_name': name,
+            'platform': data.get('platform', 'Instagram'),
+            'status': data.get('status', 'draft'),
+            'start_date': data.get('start_date') or None,
+            'end_date': data.get('end_date') or None,
+            'budget': data.get('budget', 0),
+        }
+        resp = supabase.table('campaigns').insert(row).execute()
+        audit_log('INSERT', 'campaigns', name, {'partnership_id': pid}, source='dashboard')
+        return jsonify(resp.data[0] if resp.data else {'success': True}), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/campaigns/<cid>', methods=['PUT'])
+@require_auth
+def update_campaign(cid, current_user=None):
+    if current_user.get('role') not in ('admin', 'senior'):
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        data = request.get_json(silent=True) or {}
+        allowed = ['campaign_name', 'platform', 'status', 'start_date', 'end_date', 'budget']
+        updates = {k: data[k] for k in allowed if k in data}
+        if not updates:
+            return jsonify({'error': 'Nothing to update'}), 400
+        resp = supabase.table('campaigns').update(updates).eq('id', cid).execute()
+        audit_log('UPDATE', 'campaigns', cid, updates, source='dashboard')
+        return jsonify(resp.data[0] if resp.data else {'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/campaigns/<cid>', methods=['DELETE'])
+@require_admin
+def delete_campaign(cid, current_user=None):
+    try:
+        supabase.table('campaigns').delete().eq('id', cid).execute()
+        audit_log('DELETE', 'campaigns', cid, {}, source='dashboard')
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── Campaign Entries ───
+
+@api_bp.route('/campaigns/<cid>/entries', methods=['GET'])
+@require_auth
+def list_entries(cid, current_user=None):
+    try:
+        resp = supabase.table('campaign_entries').select('*').eq('campaign_id', cid).order('created_at', desc=True).execute()
+        # Enrich with creator info from influencers table
+        for e in resp.data:
+            try:
+                inf = supabase.table('influencers').select('creator_name,followers,profile_link').eq('username', e['creator_username']).execute()
+                if inf.data:
+                    e['creator_name'] = inf.data[0].get('creator_name', '')
+                    e['followers'] = inf.data[0].get('followers', 0)
+                    e['profile_link'] = inf.data[0].get('profile_link', '')
+            except Exception:
+                pass
+        return jsonify(resp.data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/entries', methods=['POST'])
+@require_auth
+def create_entry(current_user=None):
+    if current_user.get('role') not in ('admin', 'senior'):
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        data = request.get_json(silent=True) or {}
+        username = (data.get('creator_username') or '').strip()
+        cid = data.get('campaign_id', '')
+        if not username or not cid:
+            return jsonify({'error': 'creator_username and campaign_id are required'}), 400
+        row = {
+            'campaign_id': cid,
+            'creator_username': username,
+            'deliverable_type': data.get('deliverable_type', 'Reel'),
+            'status': data.get('status', 'pending'),
+            'content_link': data.get('content_link', ''),
+            'notes': data.get('notes', ''),
+            'amount': data.get('amount', 0),
+            'delivery_date': data.get('delivery_date') or None,
+            'poc': data.get('poc', ''),
+        }
+        resp = supabase.table('campaign_entries').insert(row).execute()
+        audit_log('INSERT', 'campaign_entries', username, {'campaign_id': cid}, source='dashboard')
+        return jsonify(resp.data[0] if resp.data else {'success': True}), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/entries/<eid>', methods=['PUT'])
+@require_auth
+def update_entry(eid, current_user=None):
+    if current_user.get('role') not in ('admin', 'senior'):
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        data = request.get_json(silent=True) or {}
+        allowed = ['creator_username', 'deliverable_type', 'status', 'content_link', 'notes', 'amount', 'delivery_date', 'poc']
+        updates = {k: data[k] for k in allowed if k in data}
+        if not updates:
+            return jsonify({'error': 'Nothing to update'}), 400
+        resp = supabase.table('campaign_entries').update(updates).eq('id', eid).execute()
+        audit_log('UPDATE', 'campaign_entries', eid, updates, source='dashboard')
+        return jsonify(resp.data[0] if resp.data else {'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/entries/<eid>', methods=['DELETE'])
+@require_auth
+def delete_entry(eid, current_user=None):
+    if current_user.get('role') not in ('admin', 'senior'):
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        supabase.table('campaign_entries').delete().eq('id', eid).execute()
+        audit_log('DELETE', 'campaign_entries', eid, {}, source='dashboard')
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
