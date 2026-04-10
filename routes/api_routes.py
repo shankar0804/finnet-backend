@@ -5,9 +5,91 @@ from services.sheets_service import sync_to_google_sheet
 from database.db import supabase
 import traceback
 import logging
+import jwt
+import bcrypt
+import os
+from datetime import datetime, timezone, timedelta
+from functools import wraps
 
 api_bp = Blueprint('api_routes', __name__)
 logger = logging.getLogger(__name__)
+
+# ─── JWT Configuration ───
+JWT_SECRET = os.environ.get('JWT_SECRET', os.environ.get('FLASK_SECRET_KEY', 'trakrx-default-secret-change-me'))
+JWT_ALGORITHM = 'HS256'
+JWT_EXPIRY_HOURS = 24
+ADMIN_EMAIL = 'operations@finnetmedia.com'
+
+def create_jwt(email, name, role, picture=''):
+    """Create a signed JWT token with user details."""
+    payload = {
+        'email': email,
+        'name': name,
+        'role': role,
+        'picture': picture,
+        'iat': datetime.now(timezone.utc),
+        'exp': datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def get_current_user():
+    """Extract and verify user from Authorization: Bearer <token> header.
+    Returns dict with email, name, role or None if invalid."""
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return None
+    token = auth_header[7:]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+def require_auth(f):
+    """Decorator: require a valid JWT. Injects `current_user` kwarg."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({'error': 'Authentication required'}), 401
+        kwargs['current_user'] = user
+        return f(*args, **kwargs)
+    return decorated
+
+def require_admin(f):
+    """Decorator: require a valid JWT with admin role."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({'error': 'Authentication required'}), 401
+        if user.get('role') != 'admin':
+            return jsonify({'error': 'Admin access required'}), 403
+        kwargs['current_user'] = user
+        return f(*args, **kwargs)
+    return decorated
+
+# ─── Audit Logging ───
+def audit_log(operation, target_table, target_id='', details=None, source='dashboard', performed_by=None):
+    """Insert an audit log entry. Non-blocking — failures are logged but don't break the request."""
+    try:
+        user = performed_by or (get_current_user() or {}).get('email', 'system')
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown')
+        if ',' in ip:
+            ip = ip.split(',')[0].strip()
+        supabase.table('audit_logs').insert({
+            'operation': operation,
+            'performed_by': user,
+            'target_table': target_table,
+            'target_id': str(target_id),
+            'details': details or {},
+            'source': source,
+            'ip_address': ip,
+        }).execute()
+    except Exception as e:
+        logger.warning(f'[AUDIT] Failed to write audit log: {e}')
 
 @api_bp.route('/custom-search', methods=['POST'])
 def custom_search():
@@ -50,6 +132,11 @@ def scrape_instagram():
         # We do an UPSERT in case the influencer already exists
         resp = supabase.table("influencers").upsert(influencer_model, on_conflict="username").execute()
         
+        audit_log('UPSERT', 'influencers', username, {
+            'creator_name': influencer_model.get('creator_name'),
+            'followers': influencer_model.get('followers'),
+        }, source='dashboard')
+
         # Return success
         return jsonify({
             "creatorName": influencer_model["creator_name"],
@@ -127,11 +214,13 @@ def upload_file():
                 # Row exists — update it
                 result = supabase.table("influencers").update(ocr_update).eq("username", target_username).execute()
                 logger.info(f"[OCR] Updated {len(ocr_update)} fields for @{target_username}: {list(ocr_update.keys())}")
+                audit_log('UPDATE', 'influencers', target_username, {'ocr_fields': list(ocr_update.keys())}, source='dashboard')
             else:
                 # Row doesn't exist — create it with the OCR data
                 insert_data = {"username": target_username, **ocr_update}
                 result = supabase.table("influencers").upsert(insert_data, on_conflict="username").execute()
                 logger.info(f"[OCR] Created new row for @{target_username} with {len(ocr_update)} fields")
+                audit_log('INSERT', 'influencers', target_username, {'ocr_fields': list(ocr_update.keys())}, source='dashboard')
         except Exception as db_err:
             logger.error(f"Failed to push OCR to Supabase for @{target_username}: {db_err}")
             # Non-fatal error
@@ -157,12 +246,219 @@ def upload_file():
         logger.error(f"API /upload Error: {traceback.format_exc()}")
         return jsonify({"error": "Pipeline Failure", "details": str(e)}), 500
 
+@api_bp.route('/auth/login', methods=['POST'])
+def auth_login():
+    """Handle post-Google-sign-in. Upserts user into app_users and returns a signed JWT."""
+    try:
+        data = request.get_json(silent=True) or {}
+        email = (data.get('email') or '').strip().lower()
+        name = data.get('name', '')
+        picture = data.get('picture', '')
+
+        if not email or not email.endswith('@finnetmedia.com'):
+            return jsonify({"error": "Unauthorized domain"}), 403
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        # Check if user already exists
+        existing = supabase.table("app_users").select("*").eq("email", email).execute()
+
+        if existing.data and len(existing.data) > 0:
+            user = existing.data[0]
+            supabase.table("app_users").update({
+                "name": name,
+                "picture": picture,
+                "updated_at": now
+            }).eq("email", email).execute()
+            role = 'admin' if email == ADMIN_EMAIL else user['role']
+            if email == ADMIN_EMAIL and user['role'] != 'admin':
+                supabase.table("app_users").update({"role": "admin"}).eq("email", email).execute()
+        else:
+            role = 'admin' if email == ADMIN_EMAIL else 'junior'
+            supabase.table("app_users").insert({
+                "email": email,
+                "name": name,
+                "picture": picture,
+                "role": role,
+                "created_at": now,
+                "updated_at": now
+            }).execute()
+
+        # Issue JWT
+        token = create_jwt(email, name, role, picture)
+
+        audit_log('LOGIN', 'app_users', email, {'role': role}, source='dashboard', performed_by=email)
+
+        logger.info(f"[AUTH] User logged in: {email} (role: {role})")
+        return jsonify({
+            "email": email,
+            "name": name,
+            "role": role,
+            "token": token
+        })
+
+    except Exception as e:
+        logger.error(f"API /auth/login Error: {e}")
+        return jsonify({"error": "Login failed", "details": str(e)}), 500
+
+
+@api_bp.route('/auth/login-password', methods=['POST'])
+def auth_login_password():
+    """Username/password login for external employees."""
+    try:
+        data = request.get_json(silent=True) or {}
+        email = (data.get('email') or '').strip().lower()
+        password = data.get('password', '')
+
+        if not email or not password:
+            return jsonify({"error": "Email and password are required"}), 400
+
+        # Look up user
+        existing = supabase.table("app_users").select("*").eq("email", email).execute()
+        if not existing.data or len(existing.data) == 0:
+            return jsonify({"error": "Invalid email or password"}), 401
+
+        user = existing.data[0]
+
+        # Must be a password-auth user
+        if user.get('auth_method') != 'password':
+            return jsonify({"error": "This account uses Google Sign-In. Please use the Google button."}), 400
+
+        # Verify password
+        if not user.get('password_hash'):
+            return jsonify({"error": "Account not set up. Contact admin."}), 401
+
+        if not bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
+            return jsonify({"error": "Invalid email or password"}), 401
+
+        # Update last login
+        now = datetime.now(timezone.utc).isoformat()
+        supabase.table("app_users").update({"updated_at": now}).eq("email", email).execute()
+
+        role = user['role']
+        name = user.get('name', email.split('@')[0])
+        token = create_jwt(email, name, role)
+
+        audit_log('LOGIN', 'app_users', email, {'role': role, 'method': 'password'}, source='dashboard', performed_by=email)
+
+        return jsonify({
+            "email": email,
+            "name": name,
+            "role": role,
+            "token": token
+        })
+
+    except Exception as e:
+        logger.error(f"API /auth/login-password Error: {e}")
+        return jsonify({"error": "Login failed", "details": str(e)}), 500
+
+
+@api_bp.route('/users/create', methods=['POST'])
+@require_admin
+def create_external_user(current_user=None):
+    """Admin-only: create an external employee account with username/password."""
+    try:
+        data = request.get_json(silent=True) or {}
+        email = (data.get('email') or '').strip().lower()
+        name = (data.get('name') or '').strip()
+        password = data.get('password', '')
+        role = (data.get('role') or 'junior').strip().lower()
+
+        if not email or not password:
+            return jsonify({"error": "Email and password are required"}), 400
+
+        if len(password) < 6:
+            return jsonify({"error": "Password must be at least 6 characters"}), 400
+
+        if role not in ('junior', 'senior'):
+            role = 'junior'
+
+        # Check if user already exists
+        existing = supabase.table("app_users").select("email").eq("email", email).execute()
+        if existing.data and len(existing.data) > 0:
+            return jsonify({"error": f"User {email} already exists"}), 409
+
+        # Hash password
+        password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+        now = datetime.now(timezone.utc).isoformat()
+        supabase.table("app_users").insert({
+            "email": email,
+            "name": name or email.split('@')[0],
+            "role": role,
+            "auth_method": "password",
+            "password_hash": password_hash,
+            "created_at": now,
+            "updated_at": now
+        }).execute()
+
+        audit_log('INSERT', 'app_users', email, {'role': role, 'auth_method': 'password'}, source='dashboard')
+
+        logger.info(f"[AUTH] External user created: {email} (role: {role})")
+        return jsonify({"success": True, "email": email, "role": role})
+
+    except Exception as e:
+        logger.error(f"API /users/create Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@api_bp.route('/users', methods=['GET'])
+@require_admin
+def list_users(current_user=None):
+    """Admin-only: list all app users and their roles."""
+    try:
+        resp = supabase.table("app_users").select("*").order("created_at", desc=True).execute()
+        return jsonify(resp.data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@api_bp.route('/users/role', methods=['POST'])
+@require_admin
+def update_user_role(current_user=None):
+    """Admin-only: update a user's role."""
+    try:
+        data = request.get_json(silent=True) or {}
+        target_email = (data.get('email') or '').strip().lower()
+        new_role = (data.get('role') or '').strip().lower()
+
+        if target_email == ADMIN_EMAIL:
+            return jsonify({"error": "Cannot change admin role"}), 400
+
+        if new_role not in ('junior', 'senior'):
+            return jsonify({"error": "Role must be 'junior' or 'senior'"}), 400
+
+        supabase.table("app_users").update({
+            "role": new_role,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }).eq("email", target_email).execute()
+
+        audit_log('UPDATE', 'app_users', target_email, {'role_changed_to': new_role})
+
+        logger.info(f"[RBAC] Admin changed {target_email} role to {new_role}")
+        return jsonify({"success": True, "email": target_email, "role": new_role})
+
+    except Exception as e:
+        logger.error(f"API /users/role Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @api_bp.route('/roster', methods=['GET'])
 def get_roster():
-    """Retrieves all influencers from Supabase Database."""
+    """Retrieves all influencers. JWT determines if contact_numbers are visible."""
     try:
         resp = supabase.table("influencers").select("*").order("created_at", desc=True).execute()
-        return jsonify(resp.data)
+        rows = resp.data
+
+        # Determine role from JWT (default to junior if no token)
+        user = get_current_user()
+        role = user.get('role', 'junior') if user else 'junior'
+
+        if role == 'junior':
+            for row in rows:
+                row['contact_numbers'] = '\U0001f512'
+
+        return jsonify(rows)
     except Exception as e:
         return jsonify({"error": "Supabase Connection error", "details": str(e)}), 500
 
@@ -181,6 +477,7 @@ def get_influencer(username):
 def delete_influencer(username):
     try:
         supabase.table("influencers").delete().eq("username", username).execute()
+        audit_log('DELETE', 'influencers', username)
         return jsonify({"message": "Deleted"})
     except Exception as e:
         return jsonify({"error": "Could not delete", "details": str(e)}), 500
@@ -263,6 +560,11 @@ def update_field():
         if len(response.data) == 0:
              return jsonify({"error": f"Creator @{username} not found in database. Make sure the profile is scraped first."}), 404
 
+        audit_log('UPDATE', 'influencers', username, {
+            'field': field,
+            'new_value': str(final_value)[:200]
+        }, source='whatsapp_bot')
+
         return jsonify({
             "success": True,
             "message": f"Updated `{field}` to `{final_value}` for @{username}",
@@ -325,6 +627,8 @@ def bulk_import():
         thread = threading.Thread(target=run_import, daemon=True)
         thread.start()
 
+        audit_log('BULK_IMPORT', 'influencers', job_id, {'sheet_url': sheet_url}, source='whatsapp_bot')
+
         logger.info(f"[BULK] Job {job_id} started in background for sheet: {sheet_url}")
         return jsonify({
             'status': 'processing',
@@ -336,3 +640,14 @@ def bulk_import():
         logger.error(f'API /bulk-import Error: {traceback.format_exc()}')
         return jsonify({'error': 'Bulk import failed', 'details': str(e)}), 500
 
+
+@api_bp.route('/audit-logs', methods=['GET'])
+@require_admin
+def get_audit_logs(current_user=None):
+    """Admin-only: retrieve recent audit logs."""
+    try:
+        limit = min(int(request.args.get('limit', 100)), 500)
+        resp = supabase.table('audit_logs').select('*').order('created_at', desc=True).limit(limit).execute()
+        return jsonify(resp.data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

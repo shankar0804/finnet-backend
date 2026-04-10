@@ -56,3 +56,47 @@ CREATE POLICY "Allow anonymous read access" ON influencers FOR SELECT USING (tru
 CREATE POLICY "Allow anonymous insert access" ON influencers FOR INSERT WITH CHECK (true);
 CREATE POLICY "Allow anonymous update access" ON influencers FOR UPDATE USING (true);
 CREATE POLICY "Allow anonymous delete access" ON influencers FOR DELETE USING (true);
+
+-- ═══ App Users (RBAC) ═══
+-- Stores signed-in users and their roles.
+-- operations@finnetmedia.com = admin (hardcoded in app logic)
+-- auth_method: 'google' for @finnetmedia.com, 'password' for external employees
+-- Default role for new users = junior
+CREATE TABLE IF NOT EXISTS app_users (
+    email VARCHAR(255) PRIMARY KEY,
+    name VARCHAR(255) DEFAULT '',
+    picture TEXT DEFAULT '',
+    role VARCHAR(20) DEFAULT 'junior' CHECK (role IN ('admin', 'senior', 'junior')),
+    auth_method VARCHAR(20) DEFAULT 'google' CHECK (auth_method IN ('google', 'password')),
+    password_hash TEXT DEFAULT '',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+ALTER TABLE app_users ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Allow anonymous read access" ON app_users FOR SELECT USING (true);
+CREATE POLICY "Allow anonymous insert access" ON app_users FOR INSERT WITH CHECK (true);
+CREATE POLICY "Allow anonymous update access" ON app_users FOR UPDATE USING (true);
+CREATE POLICY "Allow anonymous delete access" ON app_users FOR DELETE USING (true);
+
+-- ═══ Audit Logs ═══
+-- Tracks all INSERT, UPDATE, DELETE operations across the system.
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    operation VARCHAR(20) NOT NULL,              -- INSERT, UPDATE, DELETE, LOGIN, EXPORT
+    performed_by VARCHAR(255) DEFAULT 'system',  -- email of the user who performed the action
+    target_table VARCHAR(100) DEFAULT '',         -- influencers, app_users, etc.
+    target_id VARCHAR(255) DEFAULT '',            -- username or email of the affected record
+    details JSONB DEFAULT '{}',                   -- what changed: {field: value} or description
+    source VARCHAR(50) DEFAULT 'dashboard',       -- dashboard, whatsapp_bot, system, bulk_import
+    ip_address VARCHAR(50) DEFAULT '',            -- request IP
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Index for fast admin queries (most recent first)
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created ON audit_logs (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs (performed_by);
+
+ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Allow anonymous read access" ON audit_logs FOR SELECT USING (true);
+CREATE POLICY "Allow anonymous insert access" ON audit_logs FOR INSERT WITH CHECK (true);
