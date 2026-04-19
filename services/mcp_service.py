@@ -10,15 +10,15 @@ from database.db import supabase
 logger = logging.getLogger(__name__)
 
 # ── Data cache to avoid fetching from Supabase on every query ──
-_cache = {"data": None, "timestamp": 0}
+_cache = {"ig": None, "yt": None, "li": None, "timestamp": 0}
 CACHE_TTL = 60  # seconds
 
 import os
 
 NVIDIA_KEY = os.environ.get("NVIDIA_KEY", "").strip()
 
-# Schema definition - single source of truth
-SCHEMA = {
+# Schema definitions — all three platform tables
+SCHEMA_IG = {
     "table": "influencers",
     "columns": {
         "id": "text",
@@ -51,16 +51,88 @@ SCHEMA = {
         "contact_numbers": "text",
         "mail_id": "text",
         "managed_by": "text",
+        "creator_group_id": "text",
         "last_scraped_at": "text",
         "last_ocr_at": "text",
         "last_manual_at": "text",
     }
 }
 
-VALID_COLUMNS = set(SCHEMA["columns"].keys())
+SCHEMA_YT = {
+    "table": "youtube_creators",
+    "columns": {
+        "id": "text",
+        "channel_id": "text",
+        "channel_handle": "text",
+        "channel_name": "text",
+        "profile_link": "text",
+        "niche": "text",
+        "language": "text",
+        "gender": "text",
+        "location": "text",
+        "subscribers": "integer",
+        "total_videos": "integer",
+        "avg_long_views": "integer",
+        "long_engagement_rate": "real",
+        "avg_long_duration": "integer",
+        "avg_short_views": "integer",
+        "short_engagement_rate": "real",
+        "avg_short_duration": "integer",
+        "avd": "text",
+        "skip_rate": "text",
+        "age_13_17": "text",
+        "age_18_24": "text",
+        "age_25_34": "text",
+        "age_35_44": "text",
+        "age_45_54": "text",
+        "male_pct": "text",
+        "female_pct": "text",
+        "city_1": "text",
+        "city_2": "text",
+        "city_3": "text",
+        "city_4": "text",
+        "city_5": "text",
+        "contact_numbers": "text",
+        "mail_id": "text",
+        "managed_by": "text",
+        "creator_group_id": "text",
+        "last_scraped_at": "text",
+        "last_ocr_at": "text",
+        "last_manual_at": "text",
+    }
+}
 
-# Columns with types for the prompt
-COLUMNS_WITH_TYPES = "\n".join(f"  - {col} ({dtype})" for col, dtype in SCHEMA["columns"].items())
+SCHEMA_LI = {
+    "table": "linkedin_creators",
+    "columns": {
+        "id": "text",
+        "profile_id": "text",
+        "full_name": "text",
+        "profile_link": "text",
+        "headline": "text",
+        "summary": "text",
+        "current_company": "text",
+        "current_title": "text",
+        "industry": "text",
+        "niche": "text",
+        "language": "text",
+        "gender": "text",
+        "location": "text",
+        "connections": "integer",
+        "contact_numbers": "text",
+        "mail_id": "text",
+        "managed_by": "text",
+        "creator_group_id": "text",
+        "last_scraped_at": "text",
+        "last_manual_at": "text",
+    }
+}
+
+ALLOWED_TABLES = {'INFLUENCERS', 'YOUTUBE_CREATORS', 'LINKEDIN_CREATORS'}
+
+# Build column listings for the prompt
+def _cols_str(schema):
+    return "\n".join(f"  - {col} ({dtype})" for col, dtype in schema["columns"].items())
 
 
 # ─── SQL SAFETY VALIDATOR ───────────────────────────────────────────
@@ -90,97 +162,109 @@ def validate_sql(sql: str) -> tuple:
         if re.search(rf'\b{kw}\b', sql_upper):
             return False, f"Blocked: dangerous keyword '{kw}' detected", ""
 
-    # Layer 3: Only allow the 'influencers' table
+    # Layer 3: Only allow the known tables
     from_matches = re.findall(r'\bFROM\s+(\w+)', sql_upper)
     join_matches = re.findall(r'\bJOIN\s+(\w+)', sql_upper)
     all_tables = from_matches + join_matches
     for table in all_tables:
-        if table != 'INFLUENCERS':
+        if table not in ALLOWED_TABLES:
             return False, f"Blocked: unauthorized table '{table}'", ""
 
     # Layer 4: Ensure at least one valid table is referenced
-    if 'INFLUENCERS' not in sql_upper:
-        return False, "Query must reference the 'influencers' table", ""
+    if not any(t in sql_upper for t in ALLOWED_TABLES):
+        return False, "Query must reference a valid table (influencers, youtube_creators, or linkedin_creators)", ""
 
     # Layer 5: Enforce a safety LIMIT to prevent huge result sets
     if 'LIMIT' not in sql_upper:
         cleaned += " LIMIT 200"
 
-    # Layer 6: Block subqueries to other tables
+    # Layer 6: Block subqueries to unauthorized tables
     subquery_froms = re.findall(r'\(\s*SELECT[^)]*FROM\s+(\w+)', sql_upper)
     for table in subquery_froms:
-        if table != 'INFLUENCERS':
+        if table not in ALLOWED_TABLES:
             return False, f"Blocked: subquery references unauthorized table '{table}'", ""
 
     return True, "OK", cleaned
 
 
-# ─── SYSTEM PROMPT FOR DIRECT SQL GENERATION ────────────────────────
+# ─── SYSTEM PROMPT FOR MULTI-TABLE SQL GENERATION ────────────────────
 
 SYSTEM_PROMPT = f"""You are an expert SQLite query writer for an influencer talent agency database.
 
 **Your job:** Convert the user's natural language question into a SINGLE valid SQLite SELECT query.
 
 **Database: SQLite (in-memory)**
-**Table: `influencers`**
-**Columns:**
-{COLUMNS_WITH_TYPES}
+
+There are THREE tables. Choose the correct one based on the user's question:
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+**Table 1: `influencers`** (Instagram creators)
+{_cols_str(SCHEMA_IG)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+**Table 2: `youtube_creators`** (YouTube channels)
+{_cols_str(SCHEMA_YT)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+**Table 3: `linkedin_creators`** (LinkedIn profiles)
+{_cols_str(SCHEMA_LI)}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+**How to choose the table:**
+- If the user says "Instagram", "IG", "reel", "followers" → use `influencers`
+- If the user says "YouTube", "YT", "channel", "subscribers", "shorts", "long-form" → use `youtube_creators`
+- If the user says "LinkedIn", "LI", "connections", "company", "headline" → use `linkedin_creators`
+- If the user says "all creators" or "all platforms" or doesn't specify → use `influencers` (default)
+- You can query ONLY ONE table per query. Do NOT join tables.
+- The tables are linked by `creator_group_id` (same UUID = same person across platforms), but cross-table JOINs are NOT needed for most queries.
 
 **Rules:**
 1. Write ONLY a single SELECT statement. No explanations, no markdown, no code fences.
-2. Use ONLY the columns listed above. Never invent columns.
-3. The table name is `influencers` — use ONLY this table.
-4. **DEFAULT columns** for most queries: `creator_name, username, profile_link, niche, followers, avg_views`. Only add extra columns if the user explicitly asks about them.
-5. Use `SELECT *` ONLY when the user asks about ALL data, missing fields, or analytical deep-dives.
-6. For text columns, empty/missing values may be NULL or empty string ''. To check for missing data, use: `(column IS NULL OR TRIM(column) = '')`
-7. For numeric columns (followers, avg_views, engagement_rate, avg_video_length), missing data is NULL or 0. To find valid data: `column IS NOT NULL AND column > 0`
+2. Use ONLY the columns listed above for the chosen table. Never invent columns.
+3. **DEFAULT columns** for Instagram queries: `creator_name, username, profile_link, niche, followers, avg_views`
+4. **DEFAULT columns** for YouTube queries: `channel_name, channel_handle, profile_link, niche, subscribers, avg_long_views, long_engagement_rate, avg_short_views, short_engagement_rate`
+5. **DEFAULT columns** for LinkedIn queries: `full_name, profile_id, profile_link, headline, current_company, connections`
+6. For text columns, empty/missing values may be NULL or empty string ''. Use: `(column IS NULL OR TRIM(column) = '')`
+7. For numeric columns, missing data is NULL or 0. To find valid data: `column IS NOT NULL AND column > 0`
 8. Use case-insensitive matching for text: `LOWER(column) LIKE LOWER('%value%')`
-9. Do NOT add a LIMIT unless the user says "top N" or a specific number. Return all matching results by default.
-10. For "lowest"/"least"/"minimum" → ORDER BY column ASC LIMIT 1 (filter out NULLs/0s for numeric columns)
-11. For "highest"/"most"/"maximum"/"top" → ORDER BY column DESC LIMIT 1 (or N)
-12. For analytical questions like "what fields are blank/missing for each creator", SELECT all columns and return all rows.
-13. Output ONLY the raw SQL. Nothing else.
+9. Do NOT add a LIMIT unless the user says "top N" or a specific number.
+10. Output ONLY the raw SQL. Nothing else.
 
 **Examples:**
 
 User: "show all creators"
 SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers
 
-User: "give me all creators with minimum 100k avg views"
-SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE avg_views IS NOT NULL AND avg_views >= 100000 ORDER BY avg_views DESC
+User: "youtube creators with more than 100k subscribers"
+SELECT channel_name, channel_handle, profile_link, niche, subscribers, avg_long_views, long_engagement_rate FROM youtube_creators WHERE subscribers > 100000 ORDER BY subscribers DESC
+
+User: "show me youtube shorts engagement rates"
+SELECT channel_name, channel_handle, subscribers, avg_short_views, short_engagement_rate FROM youtube_creators WHERE short_engagement_rate IS NOT NULL AND short_engagement_rate > 0 ORDER BY short_engagement_rate DESC
+
+User: "linkedin profiles in tech"
+SELECT full_name, profile_id, profile_link, headline, current_company, industry, connections FROM linkedin_creators WHERE LOWER(industry) LIKE '%tech%' OR LOWER(headline) LIKE '%tech%'
 
 User: "who has the most followers"
 SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE followers IS NOT NULL AND followers > 0 ORDER BY followers DESC LIMIT 1
 
-User: "lowest follower count person"
-SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE followers IS NOT NULL AND followers > 0 ORDER BY followers ASC LIMIT 1
-
 User: "beauty creators in mumbai"
 SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE LOWER(niche) LIKE LOWER('%beauty%') AND LOWER(location) LIKE LOWER('%mumbai%')
-
-User: "what data is missing for each creator"
-SELECT * FROM influencers
 
 User: "creators whose niche is blank"
 SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE niche IS NULL OR TRIM(niche) = ''
 
-User: "top 5 by engagement rate"
-SELECT creator_name, username, profile_link, niche, followers, avg_views, engagement_rate FROM influencers WHERE engagement_rate IS NOT NULL AND engagement_rate > 0 ORDER BY engagement_rate DESC LIMIT 5
-
-User: "who has no email"
-SELECT creator_name, username, profile_link, niche, followers, avg_views, mail_id FROM influencers WHERE mail_id IS NULL OR TRIM(mail_id) = ''
+User: "top 5 youtube channels by engagement"
+SELECT channel_name, channel_handle, subscribers, avg_long_views, long_engagement_rate FROM youtube_creators WHERE long_engagement_rate IS NOT NULL AND long_engagement_rate > 0 ORDER BY long_engagement_rate DESC LIMIT 5
 
 User: "count of creators by niche"
 SELECT niche, COUNT(*) as count FROM influencers WHERE niche IS NOT NULL AND TRIM(niche) != '' GROUP BY niche ORDER BY count DESC
 
-User: "average followers"
-SELECT AVG(followers) as avg_followers, MIN(followers) as min_followers, MAX(followers) as max_followers FROM influencers WHERE followers IS NOT NULL AND followers > 0 LIMIT 1
+User: "show me all youtube data"
+SELECT * FROM youtube_creators
 
-User: "creators with more than 1 million followers"
-SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE followers > 1000000 ORDER BY followers DESC
-
-User: "show me engagement rate for all creators"
-SELECT creator_name, username, niche, followers, avg_views, engagement_rate FROM influencers WHERE engagement_rate IS NOT NULL AND engagement_rate > 0 ORDER BY engagement_rate DESC"""
+User: "linkedin creators at google"
+SELECT full_name, profile_id, profile_link, headline, current_company, connections FROM linkedin_creators WHERE LOWER(current_company) LIKE '%google%'"""
 
 
 # ─── INSIGHT PROMPT ─────────────────────────────────────────────────
@@ -198,23 +282,47 @@ Rules:
 
 
 async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict:
-    """Direct SQL approach: LLM writes SQL, we validate & execute safely."""
+    """Direct SQL approach: LLM writes SQL, we validate & execute safely.
+    
+    Now supports all three tables: influencers, youtube_creators, linkedin_creators.
+    """
     try:
-        # 1. Fetch data (with 60s cache to avoid repeated Supabase round-trips)
+        # 1. Fetch data from all tables (with 60s cache)
         now = time.time()
-        if _cache["data"] is None or (now - _cache["timestamp"]) > CACHE_TTL:
-            response = supabase.table("influencers").select("*").execute()
-            _cache["data"] = response.data
+        if _cache["ig"] is None or (now - _cache["timestamp"]) > CACHE_TTL:
+            ig_resp = supabase.table("influencers").select("*").execute()
+            yt_resp = supabase.table("youtube_creators").select("*").execute()
+            li_resp = supabase.table("linkedin_creators").select("*").execute()
+            _cache["ig"] = ig_resp.data or []
+            _cache["yt"] = yt_resp.data or []
+            _cache["li"] = li_resp.data or []
             _cache["timestamp"] = now
 
-        db_records = _cache["data"]
-        if not db_records:
-            return {"type": "data", "data": [], "insight": "The database is currently empty."}
+        ig_records = _cache["ig"]
+        yt_records = _cache["yt"]
+        li_records = _cache["li"]
 
-        # Load into in-memory SQLite for querying
-        df = pd.DataFrame(db_records)
+        total = len(ig_records) + len(yt_records) + len(li_records)
+        if total == 0:
+            return {"type": "data", "data": [], "insight": "The database is currently empty across all platforms."}
+
+        # Load all tables into in-memory SQLite
         conn = sqlite3.connect(':memory:')
-        df.to_sql('influencers', conn, index=False)
+        if ig_records:
+            pd.DataFrame(ig_records).to_sql('influencers', conn, index=False)
+        else:
+            # Create empty table so queries don't fail
+            pd.DataFrame(columns=list(SCHEMA_IG["columns"].keys())).to_sql('influencers', conn, index=False)
+
+        if yt_records:
+            pd.DataFrame(yt_records).to_sql('youtube_creators', conn, index=False)
+        else:
+            pd.DataFrame(columns=list(SCHEMA_YT["columns"].keys())).to_sql('youtube_creators', conn, index=False)
+
+        if li_records:
+            pd.DataFrame(li_records).to_sql('linkedin_creators', conn, index=False)
+        else:
+            pd.DataFrame(columns=list(SCHEMA_LI["columns"].keys())).to_sql('linkedin_creators', conn, index=False)
 
         # 2. Ask LLM to write SQL directly
         client_llm = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_KEY)
@@ -257,12 +365,19 @@ async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict
             result_df = pd.read_sql_query(cleaned_sql, conn)
         except sqlite3.Error as sql_err:
             logger.error(f"[MCP] SQL execution error: {sql_err} | SQL: {cleaned_sql}")
-            # Fallback: try a simple SELECT * query
+            # Fallback: try a simple SELECT * query on the most likely table
             try:
-                fallback_sql = "SELECT * FROM influencers LIMIT 50"
+                # Detect which table was intended
+                sql_upper = cleaned_sql.upper()
+                if 'YOUTUBE_CREATORS' in sql_upper:
+                    fallback_sql = "SELECT * FROM youtube_creators LIMIT 50"
+                elif 'LINKEDIN_CREATORS' in sql_upper:
+                    fallback_sql = "SELECT * FROM linkedin_creators LIMIT 50"
+                else:
+                    fallback_sql = "SELECT * FROM influencers LIMIT 50"
                 result_df = pd.read_sql_query(fallback_sql, conn)
                 cleaned_sql = fallback_sql
-                logger.info("[MCP] Fell back to SELECT * FROM influencers")
+                logger.info(f"[MCP] Fell back to: {fallback_sql}")
             except:
                 return {"type": "error", "message": f"Query error: {sql_err}", "sql": cleaned_sql}
 

@@ -25,9 +25,13 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24).hex())
 app.config['TEMPLATES_AUTO_RELOAD'] = True
 
-# Enable CORS for frontend (Vercel or local)
-FRONTEND_URL = os.environ.get('FRONTEND_URL', '*')
-CORS(app, resources={r"/api/*": {"origins": FRONTEND_URL}}, supports_credentials=True)
+# Enable CORS for frontend (Vercel, local React dev, etc.)
+# FRONTEND_URL can be comma-separated: "https://finnet-frontend.vercel.app,http://localhost:5173"
+_cors_env = os.environ.get('FRONTEND_URL', '*')
+CORS_ORIGINS = [o.strip() for o in _cors_env.split(',') if o.strip()] if _cors_env != '*' else '*'
+if CORS_ORIGINS != '*' and 'http://localhost:5000' not in CORS_ORIGINS:
+    CORS_ORIGINS.append('http://localhost:5000')
+CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}}, supports_credentials=True)
 
 # Register Component Architecture
 app.register_blueprint(view_bp)

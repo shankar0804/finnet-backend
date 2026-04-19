@@ -1,5 +1,7 @@
 from flask import Blueprint, request, jsonify, session
-from services.scraper_service import fetch_influencer_data
+from services.scraper_service import fetch_influencer_data, InsufficientDataError
+from services.youtube_scraper_service import fetch_youtube_data
+from services.linkedin_scraper_service import fetch_linkedin_data
 from services.ocr_service import run_ocr_pipeline
 from services.sheets_service import sync_to_google_sheet
 from database.db import supabase
@@ -8,6 +10,7 @@ import logging
 import jwt
 import bcrypt
 import os
+import uuid
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
@@ -144,47 +147,96 @@ def scrape_instagram():
             "followers": influencer_model["followers"],
             "message": "Successfully appended to Roster Database!"
         })
+    except InsufficientDataError as e:
+        # Not enough reel data — do NOT save zeros to DB, inform the user
+        logger.warning(f"API /scrape-instagram Insufficient data for @{username}: {e}")
+        return jsonify({
+            "error": "Insufficient Data",
+            "details": str(e),
+            "username": username,
+        }), 422
     except Exception as e:
         logger.error(f"API /scrape-instagram Error: {e}")
         return jsonify({"error": "Scraping/DB Error", "details": str(e)}), 500
 
 @api_bp.route('/upload', methods=['POST'])
 def upload_file():
-    """Processes OCR Screenshot, updates Supabase AVD logic, and pushes to Google Sheets."""
+    """Processes OCR Screenshot, updates the correct platform table (Instagram/YouTube/LinkedIn).
+
+    Auto-detects the platform from the provided link:
+    - instagram.com → influencers table (match by username)
+    - youtube.com   → youtube_creators table (match by channel_handle)
+    - linkedin.com  → linkedin_creators table (match by profile_id)
+    - Plain text     → defaults to Instagram (backwards compatible)
+    """
     if 'image' not in request.files: return jsonify({"error": "No image part"}), 400
     file = request.files['image']
     if file.filename == '': return jsonify({"error": "No selected file"}), 400
-    
-    # Needs a specific Target Influencer to link the OCR data to
-    target_username = request.form.get('target_username', '').strip().lstrip('@')
-    if 'instagram.com' in target_username:
-        import re
-        match = re.search(r'instagram\.com/([A-Za-z0-9_.]+)', target_username)
-        if match: target_username = match.group(1)
-        target_username = target_username.split('?')[0].split('/')[0].strip()
-        
-    if not target_username:
-        return jsonify({"error": "You must provide the Instagram Username to link this OCR data to!"}), 400
-        
+
+    import re
+
+    # ─── Detect platform and extract identifier from the link ───
+    raw_input = request.form.get('target_username', '').strip()
+    if not raw_input:
+        return jsonify({"error": "You must provide a creator link or username to attach this OCR data to!"}), 400
+
+    platform = 'instagram'  # default
+    identifier = raw_input.lstrip('@')
+
+    if 'youtube.com' in raw_input:
+        platform = 'youtube'
+        # Extract @handle from youtube.com/@handle
+        match = re.search(r'youtube\.com/@([^/\s?]+)', raw_input)
+        if match:
+            identifier = match.group(1)
+        else:
+            # Try channel URL format
+            match = re.search(r'youtube\.com/channel/([^/\s?]+)', raw_input)
+            if match:
+                identifier = match.group(1)
+            else:
+                identifier = raw_input.split('youtube.com/')[-1].strip('/').split('?')[0].split('/')[0]
+    elif 'linkedin.com' in raw_input:
+        platform = 'linkedin'
+        match = re.search(r'linkedin\.com/in/([^/\s?]+)', raw_input)
+        if match:
+            identifier = match.group(1)
+        else:
+            identifier = raw_input.split('linkedin.com/in/')[-1].strip('/').split('?')[0]
+    elif 'instagram.com' in raw_input:
+        platform = 'instagram'
+        match = re.search(r'instagram\.com/([A-Za-z0-9_.]+)', raw_input)
+        if match:
+            identifier = match.group(1)
+        else:
+            identifier = raw_input.split('instagram.com/')[-1].strip('/').split('?')[0].split('/')[0]
+    else:
+        # Plain text — assume Instagram username
+        identifier = raw_input.lstrip('@').split('?')[0].split('/')[0].strip()
+
+    if not identifier:
+        return jsonify({"error": "Could not extract a valid identifier from the provided link."}), 400
+
+    logger.info(f"[OCR] Detected platform: {platform}, identifier: {identifier}")
+
     try:
         # Layer 1: Run Heavy AI Extractor Pipeline
         image_bytes = file.read()
         pipeline_output = run_ocr_pipeline(image_bytes)
         final_result = pipeline_output['result']
-        
+
         if "error" in final_result:
             return jsonify({"error": "AI could not parse standard metrics", "details": final_result}), 500
-        
-        # Layer 2: Update Supabase Row with OCR metrics
-        # Sanitize: convert "N/A" or similar to empty strings
+
+        # Layer 2: Build OCR update payload
         def clean(val):
             if not val or str(val).strip().lower() in ('n/a', 'na', 'none', '-'):
                 return ''
             return str(val).strip()
-        
+
         avd_val = clean(final_result.get("average_view_duration", ""))
         skip_val = clean(final_result.get("skip_rate", ""))
-        
+
         from datetime import datetime, timezone
         ocr_update_raw = {
             "avd": avd_val,
@@ -202,30 +254,52 @@ def upload_file():
             "city_4": clean(final_result.get("city_4", "")),
             "city_5": clean(final_result.get("city_5", ""))
         }
-        
-        # Only update fields that actually have data (don't overwrite existing db data with empty strings)
+
+        # Only update fields that actually have data
         ocr_update = {k: v for k, v in ocr_update_raw.items() if v != ""}
         ocr_update["last_ocr_at"] = datetime.now(timezone.utc).isoformat()
-        
+
+        # Layer 3: Update the correct table based on detected platform
         try:
-            # First check if the row exists
-            existing = supabase.table("influencers").select("username").eq("username", target_username).execute()
-            if existing.data and len(existing.data) > 0:
-                # Row exists — update it
-                result = supabase.table("influencers").update(ocr_update).eq("username", target_username).execute()
-                logger.info(f"[OCR] Updated {len(ocr_update)} fields for @{target_username}: {list(ocr_update.keys())}")
-                audit_log('UPDATE', 'influencers', target_username, {'ocr_fields': list(ocr_update.keys())}, source='dashboard')
-            else:
-                # Row doesn't exist — create it with the OCR data
-                insert_data = {"username": target_username, **ocr_update}
-                result = supabase.table("influencers").upsert(insert_data, on_conflict="username").execute()
-                logger.info(f"[OCR] Created new row for @{target_username} with {len(ocr_update)} fields")
-                audit_log('INSERT', 'influencers', target_username, {'ocr_fields': list(ocr_update.keys())}, source='dashboard')
+            if platform == 'youtube':
+                # Try matching by channel_handle first, then channel_id
+                existing = supabase.table("youtube_creators").select("channel_id").eq("channel_handle", identifier).execute()
+                if not existing.data:
+                    existing = supabase.table("youtube_creators").select("channel_id").eq("channel_id", identifier).execute()
+                if existing.data and len(existing.data) > 0:
+                    match_col = "channel_handle" if supabase.table("youtube_creators").select("channel_id").eq("channel_handle", identifier).execute().data else "channel_id"
+                    supabase.table("youtube_creators").update(ocr_update).eq(match_col, identifier).execute()
+                    logger.info(f"[OCR] Updated youtube_creators ({match_col}={identifier}): {list(ocr_update.keys())}")
+                    audit_log('UPDATE', 'youtube_creators', identifier, {'ocr_fields': list(ocr_update.keys())}, source='dashboard')
+                else:
+                    return jsonify({"error": f"YouTube channel '{identifier}' not found in database. Scrape the channel first."}), 404
+
+            elif platform == 'linkedin':
+                existing = supabase.table("linkedin_creators").select("profile_id").eq("profile_id", identifier).execute()
+                if existing.data and len(existing.data) > 0:
+                    supabase.table("linkedin_creators").update(ocr_update).eq("profile_id", identifier).execute()
+                    logger.info(f"[OCR] Updated linkedin_creators (profile_id={identifier}): {list(ocr_update.keys())}")
+                    audit_log('UPDATE', 'linkedin_creators', identifier, {'ocr_fields': list(ocr_update.keys())}, source='dashboard')
+                else:
+                    return jsonify({"error": f"LinkedIn profile '{identifier}' not found in database. Scrape the profile first."}), 404
+
+            else:  # instagram (default)
+                existing = supabase.table("influencers").select("username").eq("username", identifier).execute()
+                if existing.data and len(existing.data) > 0:
+                    supabase.table("influencers").update(ocr_update).eq("username", identifier).execute()
+                    logger.info(f"[OCR] Updated influencers (username={identifier}): {list(ocr_update.keys())}")
+                    audit_log('UPDATE', 'influencers', identifier, {'ocr_fields': list(ocr_update.keys())}, source='dashboard')
+                else:
+                    # Instagram: create row if it doesn't exist (backwards compatible)
+                    insert_data = {"username": identifier, **ocr_update}
+                    supabase.table("influencers").upsert(insert_data, on_conflict="username").execute()
+                    logger.info(f"[OCR] Created new influencers row for @{identifier}")
+                    audit_log('INSERT', 'influencers', identifier, {'ocr_fields': list(ocr_update.keys())}, source='dashboard')
+
         except Exception as db_err:
-            logger.error(f"Failed to push OCR to Supabase for @{target_username}: {db_err}")
-            # Non-fatal error
-            
-        # Layer 3: Optionally Sync to Google Sheets
+            logger.error(f"Failed to push OCR to Supabase for {platform}/{identifier}: {db_err}")
+
+        # Layer 4: Optionally Sync to Google Sheets
         sheet_id = request.form.get('spreadsheet_id')
         if 'credentials' in session:
             try:
@@ -239,9 +313,13 @@ def upload_file():
                 final_result['_google_sheet_status'] = f"error: {str(sheet_err)}"
         else:
             final_result['_google_sheet_status'] = "skipped_no_credentials"
-            
+
+        # Include platform info in response
+        final_result['_platform_detected'] = platform
+        final_result['_identifier'] = identifier
+
         return jsonify(pipeline_output)
-        
+
     except Exception as e:
         logger.error(f"API /upload Error: {traceback.format_exc()}")
         return jsonify({"error": "Pipeline Failure", "details": str(e)}), 500
@@ -683,12 +761,33 @@ def list_partnerships(current_user=None):
     try:
         query = supabase.table('partnerships').select('*').order('created_at', desc=True)
         if current_user.get('role') == 'brand':
-            query = query.eq('contact_email', current_user.get('email', ''))
+            email = current_user.get('email', '')
+            query = query.eq('brand_username', email.split('@')[0])
         resp = query.execute()
-        # Add campaign count for each partnership
+        # Add campaigns for each partnership
         for p in resp.data:
-            camp = supabase.table('campaigns').select('id', count='exact').eq('partnership_id', p['id']).execute()
-            p['campaign_count'] = camp.count if hasattr(camp, 'count') and camp.count is not None else len(camp.data)
+            camp_resp = supabase.table('campaigns').select('*').eq('partnership_id', p['id']).order('created_at', desc=True).execute()
+            campaigns = camp_resp.data or []
+            # Add FY/month metadata for frontend grouping
+            for c in campaigns:
+                if c.get('start_date'):
+                    from datetime import datetime as dt
+                    try:
+                        d = dt.strptime(c['start_date'], '%Y-%m-%d')
+                        c['month'] = d.strftime('%b')
+                        c['year'] = d.year
+                        fy_start = d.year if d.month >= 4 else d.year - 1
+                        c['fy'] = f"FY {str(fy_start)[-2:]}-{str(fy_start+1)[-2:]}"
+                    except Exception:
+                        c['month'] = ''
+                        c['year'] = ''
+                        c['fy'] = 'Undated'
+                else:
+                    c['month'] = ''
+                    c['year'] = ''
+                    c['fy'] = 'Undated'
+            p['campaigns'] = campaigns
+            p['campaign_count'] = len(campaigns)
         return jsonify(resp.data)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -697,25 +796,90 @@ def list_partnerships(current_user=None):
 @api_bp.route('/partnerships', methods=['POST'])
 @require_auth
 def create_partnership(current_user=None):
-    """Create a new partnership. Admin/Senior only."""
+    """Onboard a new brand: create partnership + brand user account."""
     if current_user.get('role') not in ('admin', 'senior'):
         return jsonify({'error': 'Access denied'}), 403
     try:
         data = request.get_json(silent=True) or {}
         brand_name = (data.get('brand_name') or '').strip()
+        brand_username = (data.get('brand_username') or '').strip().lower()
+        password = (data.get('password') or '').strip()
+        finnet_poc = (data.get('finnet_poc') or '').strip().lower()
+
         if not brand_name:
             return jsonify({'error': 'Brand name is required'}), 400
+        if not brand_username:
+            return jsonify({'error': 'Username is required'}), 400
+        if not password or len(password) < 6:
+            return jsonify({'error': 'Password must be at least 6 characters'}), 400
+        if not finnet_poc:
+            return jsonify({'error': 'Finnet PoC email is required'}), 400
+
+        # Validate finnet_poc exists in app_users
+        poc_check = supabase.table('app_users').select('email').eq('email', finnet_poc).execute()
+        if not poc_check.data:
+            return jsonify({'error': f'Finnet PoC "{finnet_poc}" is not a registered team member'}), 400
+
+        # Generate brand hash (8-char hex from UUID)
+        import hashlib
+        brand_hash = hashlib.sha256(f"{brand_name}-{brand_username}-{datetime.now(timezone.utc).isoformat()}".encode()).hexdigest()[:12]
+
+        # Check for duplicate username
+        brand_email = f"{brand_username}@finnetmedia.com"
+        existing = supabase.table('app_users').select('email').eq('email', brand_email).execute()
+        if existing.data:
+            return jsonify({'error': f'Username "{brand_username}" is already taken'}), 409
+
+        # 1. Create brand user in app_users
+        now = datetime.now(timezone.utc).isoformat()
+        pw_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        user_data = {
+            'email': brand_email,
+            'name': brand_name,
+            'role': 'brand',
+            'auth_method': 'password',
+            'password_hash': pw_hash,
+            'created_at': now,
+            'updated_at': now,
+        }
+        logger.info(f"[BRAND ONBOARD] Step 1: Creating app_user {brand_email}...")
+        user_resp = supabase.table('app_users').insert(user_data).execute()
+        if not user_resp.data:
+            logger.error(f"[BRAND ONBOARD] app_users insert returned no data: {user_resp}")
+            return jsonify({'error': 'Failed to create brand user account. Check server logs.'}), 500
+        logger.info(f"[BRAND ONBOARD] Step 1 OK: app_user created → {user_resp.data}")
+        audit_log('INSERT', 'app_users', brand_email, {'role': 'brand', 'type': 'brand_onboard'}, source='dashboard')
+
+        # 2. Create partnership
         row = {
             'brand_name': brand_name,
-            'contact_email': (data.get('contact_email') or '').strip().lower(),
+            'brand_poc_1': (data.get('brand_poc_1') or '').strip(),
+            'brand_poc_2': (data.get('brand_poc_2') or '').strip(),
+            'brand_poc_3': (data.get('brand_poc_3') or '').strip(),
+            'finnet_poc': finnet_poc,
+            'brand_username': brand_username,
+            'brand_hash': brand_hash,
             'status': data.get('status', 'active'),
             'notes': data.get('notes', ''),
             'created_by': current_user.get('email', ''),
         }
+        logger.info(f"[BRAND ONBOARD] Step 2: Creating partnership '{brand_name}'...")
         resp = supabase.table('partnerships').insert(row).execute()
-        audit_log('INSERT', 'partnerships', brand_name, row, source='dashboard')
-        return jsonify(resp.data[0] if resp.data else {'success': True}), 201
+        if not resp.data:
+            logger.error(f"[BRAND ONBOARD] partnerships insert returned no data: {resp}")
+            return jsonify({'error': 'Failed to create partnership record. Check server logs.'}), 500
+        logger.info(f"[BRAND ONBOARD] Step 2 OK: partnership created → id={resp.data[0].get('id')}")
+        audit_log('INSERT', 'partnerships', brand_name, {
+            'brand_hash': brand_hash, 'brand_email': brand_email, 'finnet_poc': finnet_poc
+        }, source='dashboard')
+
+        result = resp.data[0] if resp.data else {'success': True}
+        result['brand_login_email'] = brand_email
+        logger.info(f"[BRAND ONBOARD] ✅ Complete: {brand_name} → {brand_email} (hash: {brand_hash})")
+        return jsonify(result), 201
+
     except Exception as e:
+        logger.error(f"[BRAND ONBOARD] ❌ Error: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -726,7 +890,7 @@ def update_partnership(pid, current_user=None):
         return jsonify({'error': 'Access denied'}), 403
     try:
         data = request.get_json(silent=True) or {}
-        allowed = ['brand_name', 'contact_email', 'status', 'notes']
+        allowed = ['brand_name', 'brand_poc_1', 'brand_poc_2', 'brand_poc_3', 'finnet_poc', 'status', 'notes']
         updates = {k: data[k] for k in allowed if k in data}
         if not updates:
             return jsonify({'error': 'Nothing to update'}), 400
@@ -746,6 +910,38 @@ def delete_partnership(pid, current_user=None):
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/brand-portal/<brand_hash>', methods=['GET'])
+@require_auth
+def get_brand_by_hash(brand_hash, current_user=None):
+    """Fetch brand data by hash. Brand users can only access their own hash."""
+    try:
+        resp = supabase.table('partnerships').select('*').eq('brand_hash', brand_hash).execute()
+        if not resp.data:
+            return jsonify({'error': 'Brand not found'}), 404
+
+        brand = resp.data[0]
+
+        # Brand users can only view their own brand
+        if current_user.get('role') == 'brand':
+            brand_email = f"{brand.get('brand_username', '')}@finnetmedia.com"
+            if current_user.get('email', '') != brand_email:
+                return jsonify({'error': 'Access denied'}), 403
+
+        # Fetch campaigns for this brand
+        camps = supabase.table('campaigns').select('*').eq('partnership_id', brand['id']).order('created_at', desc=True).execute()
+        brand['campaigns'] = camps.data
+
+        # Fetch entries for each campaign
+        for c in brand['campaigns']:
+            entries = supabase.table('campaign_entries').select('*').eq('campaign_id', c['id']).execute()
+            c['entries'] = entries.data
+
+        return jsonify(brand)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 
 # ─── Campaigns ───
@@ -778,7 +974,7 @@ def create_campaign(current_user=None):
         row = {
             'partnership_id': pid,
             'campaign_name': name,
-            'platform': data.get('platform', 'Instagram'),
+            'platforms': data.get('platforms', 'Instagram'),
             'status': data.get('status', 'draft'),
             'start_date': data.get('start_date') or None,
             'end_date': data.get('end_date') or None,
@@ -798,7 +994,7 @@ def update_campaign(cid, current_user=None):
         return jsonify({'error': 'Access denied'}), 403
     try:
         data = request.get_json(silent=True) or {}
-        allowed = ['campaign_name', 'platform', 'status', 'start_date', 'end_date', 'budget']
+        allowed = ['campaign_name', 'platforms', 'status', 'start_date', 'end_date', 'budget']
         updates = {k: data[k] for k in allowed if k in data}
         if not updates:
             return jsonify({'error': 'Nothing to update'}), 400
@@ -898,5 +1094,338 @@ def delete_entry(eid, current_user=None):
         supabase.table('campaign_entries').delete().eq('id', eid).execute()
         audit_log('DELETE', 'campaign_entries', eid, {}, source='dashboard')
         return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/campaigns/<cid>/import-sheet', methods=['POST'])
+@require_auth
+def import_sheet_entries(cid, current_user=None):
+    """Bulk import campaign entries from a Google Sheet URL or JSON array."""
+    if current_user.get('role') not in ('admin', 'senior'):
+        return jsonify({'error': 'Access denied'}), 403
+    try:
+        data = request.get_json(silent=True) or {}
+        sheet_url = (data.get('sheet_url') or '').strip()
+        rows = data.get('rows') or []
+
+        if not sheet_url and not rows:
+            return jsonify({'error': 'Provide either a Google Sheet URL or a rows array'}), 400
+
+        # If sheet_url is provided, fetch and parse the CSV
+        if sheet_url and not rows:
+            import re, csv, io, requests as req
+            # Extract the Google Sheet ID
+            match = re.search(r'/d/([a-zA-Z0-9_-]+)', sheet_url)
+            if not match:
+                return jsonify({'error': 'Invalid Google Sheet URL. Share the sheet as "Anyone with the link".'}), 400
+            sheet_id = match.group(1)
+            # Check for gid (tab ID)
+            gid_match = re.search(r'gid=(\d+)', sheet_url)
+            gid = gid_match.group(1) if gid_match else '0'
+            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+            logger.info(f"[SHEET IMPORT] Fetching CSV from: {csv_url}")
+            resp = req.get(csv_url, timeout=30)
+            if resp.status_code != 200:
+                return jsonify({'error': f'Failed to fetch sheet (HTTP {resp.status_code}). Make sure sharing is set to "Anyone with the link".'}), 400
+            reader = csv.DictReader(io.StringIO(resp.text))
+            rows = list(reader)
+            logger.info(f"[SHEET IMPORT] Parsed {len(rows)} rows from sheet")
+
+        # Map column names to campaign_entries fields
+        FIELD_MAP = {
+            'creator_username': ['creator_username', 'username', 'creator', 'handle', 'ig_handle', 'instagram'],
+            'deliverable_type': ['deliverable_type', 'deliverable', 'type', 'content_type', 'asset'],
+            'status': ['status'],
+            'content_link': ['content_link', 'live_link', 'link', 'post_link', 'url'],
+            'notes': ['notes', 'note', 'remarks'],
+            'amount': ['amount', 'commercials', 'fee', 'cost', 'budget', 'price'],
+            'delivery_date': ['delivery_date', 'date', 'due_date', 'deadline'],
+            'poc': ['poc', 'point_of_contact', 'assigned_to'],
+        }
+
+        def map_row(raw):
+            mapped = {'campaign_id': cid}
+            # Normalize keys to lowercase
+            normed = {k.strip().lower().replace(' ', '_'): v for k, v in raw.items() if k}
+            for field, aliases in FIELD_MAP.items():
+                for alias in aliases:
+                    if alias in normed and normed[alias]:
+                        val = str(normed[alias]).strip()
+                        if field == 'amount':
+                            try:
+                                val = float(val.replace(',', '').replace('₹', '').replace('$', ''))
+                            except (ValueError, TypeError):
+                                val = 0
+                        mapped[field] = val
+                        break
+            return mapped
+
+        entries = [map_row(r) for r in rows]
+        # Filter out rows without creator_username
+        entries = [e for e in entries if e.get('creator_username')]
+        if not entries:
+            return jsonify({'error': 'No valid rows found. Sheet must have a "creator_username" or "username" column.'}), 400
+
+        # Set defaults
+        for e in entries:
+            e.setdefault('deliverable_type', 'Reel')
+            e.setdefault('status', 'pending')
+            e.setdefault('content_link', '')
+            e.setdefault('notes', '')
+            e.setdefault('amount', 0)
+            e.setdefault('poc', '')
+
+        # Bulk insert
+        resp = supabase.table('campaign_entries').insert(entries).execute()
+        count = len(resp.data) if resp.data else 0
+        audit_log('BULK_INSERT', 'campaign_entries', cid, {'count': count, 'source': 'sheet_import'}, source='dashboard')
+        logger.info(f"[SHEET IMPORT] ✅ Imported {count} entries into campaign {cid}")
+        return jsonify({'imported': count, 'entries': resp.data}), 201
+    except Exception as e:
+        logger.error(f"[SHEET IMPORT] ❌ Error: {traceback.format_exc()}")
+        return jsonify({'error': str(e)}), 500
+
+# ═══════════════════════════════════════════════════════════
+# YouTube Creator Endpoints
+# ═══════════════════════════════════════════════════════════
+
+@api_bp.route('/scrape-youtube', methods=['POST'])
+def scrape_youtube():
+    """Scrape a YouTube channel and save to youtube_creators table."""
+    data = request.get_json()
+    channel_input = data.get('channel', '').strip()
+    if not channel_input:
+        return jsonify({'error': 'Missing channel URL or handle'}), 400
+
+    try:
+        yt_data = fetch_youtube_data(channel_input)
+
+        resp = supabase.table('youtube_creators').upsert(
+            yt_data, on_conflict='channel_id'
+        ).execute()
+
+        audit_log('UPSERT', 'youtube_creators', yt_data.get('channel_id'), {
+            'channel_name': yt_data.get('channel_name'),
+            'subscribers': yt_data.get('subscribers'),
+        }, source='dashboard')
+
+        return jsonify({
+            'channelName': yt_data['channel_name'],
+            'channelId': yt_data['channel_id'],
+            'subscribers': yt_data['subscribers'],
+            'message': 'Successfully added YouTube channel to database!'
+        })
+    except InsufficientDataError as e:
+        logger.warning(f"API /scrape-youtube Insufficient data for {channel_input}: {e}")
+        return jsonify({
+            'error': 'Insufficient Data',
+            'details': str(e),
+            'channel': channel_input,
+        }), 422
+    except Exception as e:
+        logger.error(f"API /scrape-youtube Error: {e}")
+        return jsonify({'error': 'Scraping/DB Error', 'details': str(e)}), 500
+
+
+@api_bp.route('/youtube-roster', methods=['GET'])
+def get_youtube_roster():
+    """List all YouTube creators."""
+    try:
+        resp = supabase.table('youtube_creators').select('*').order('created_at', desc=True).execute()
+        rows = resp.data
+
+        user = get_current_user()
+        role = user.get('role', 'junior') if user else 'junior'
+        if role == 'junior':
+            for row in rows:
+                row['contact_numbers'] = '\U0001f512'
+
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify({'error': 'Database error', 'details': str(e)}), 500
+
+
+@api_bp.route('/youtube-roster/<channel_id>', methods=['DELETE'])
+def delete_youtube_creator(channel_id):
+    try:
+        supabase.table('youtube_creators').delete().eq('channel_id', channel_id).execute()
+        audit_log('DELETE', 'youtube_creators', channel_id)
+        return jsonify({'message': 'Deleted'})
+    except Exception as e:
+        return jsonify({'error': 'Could not delete', 'details': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+# LinkedIn Creator Endpoints
+# ═══════════════════════════════════════════════════════════
+
+@api_bp.route('/scrape-linkedin', methods=['POST'])
+def scrape_linkedin():
+    """Scrape a LinkedIn profile and save to linkedin_creators table."""
+    data = request.get_json()
+    profile_input = data.get('profile', '').strip()
+    if not profile_input:
+        return jsonify({'error': 'Missing LinkedIn profile URL or identifier'}), 400
+
+    try:
+        li_data = fetch_linkedin_data(profile_input)
+
+        resp = supabase.table('linkedin_creators').upsert(
+            li_data, on_conflict='profile_id'
+        ).execute()
+
+        audit_log('UPSERT', 'linkedin_creators', li_data.get('profile_id'), {
+            'full_name': li_data.get('full_name'),
+            'current_company': li_data.get('current_company'),
+        }, source='dashboard')
+
+        return jsonify({
+            'fullName': li_data['full_name'],
+            'profileId': li_data['profile_id'],
+            'headline': li_data['headline'],
+            'message': 'Successfully added LinkedIn profile to database!'
+        })
+    except Exception as e:
+        logger.error(f"API /scrape-linkedin Error: {e}")
+        return jsonify({'error': 'Scraping/DB Error', 'details': str(e)}), 500
+
+
+@api_bp.route('/linkedin-roster', methods=['GET'])
+def get_linkedin_roster():
+    """List all LinkedIn creators."""
+    try:
+        resp = supabase.table('linkedin_creators').select('*').order('created_at', desc=True).execute()
+        rows = resp.data
+
+        user = get_current_user()
+        role = user.get('role', 'junior') if user else 'junior'
+        if role == 'junior':
+            for row in rows:
+                row['contact_numbers'] = '\U0001f512'
+
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify({'error': 'Database error', 'details': str(e)}), 500
+
+
+@api_bp.route('/linkedin-roster/<profile_id>', methods=['DELETE'])
+def delete_linkedin_creator(profile_id):
+    try:
+        supabase.table('linkedin_creators').delete().eq('profile_id', profile_id).execute()
+        audit_log('DELETE', 'linkedin_creators', profile_id)
+        return jsonify({'message': 'Deleted'})
+    except Exception as e:
+        return jsonify({'error': 'Could not delete', 'details': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+# Cross-Platform Profile Linking
+# ═══════════════════════════════════════════════════════════
+
+@api_bp.route('/link-profiles', methods=['POST'])
+def link_profiles():
+    """Link profiles across platforms using a shared creator_group_id.
+
+    Body: { instagram_username?, youtube_channel_id?, linkedin_profile_id? }
+    At least 2 must be provided.
+    """
+    data = request.get_json()
+    ig_username = data.get('instagram_username', '').strip()
+    yt_channel_id = data.get('youtube_channel_id', '').strip()
+    li_profile_id = data.get('linkedin_profile_id', '').strip()
+
+    provided = sum(bool(x) for x in [ig_username, yt_channel_id, li_profile_id])
+    if provided < 2:
+        return jsonify({'error': 'At least 2 platform profiles must be provided to link'}), 400
+
+    try:
+        # Check if any of the profiles already has a creator_group_id
+        group_id = None
+
+        if ig_username:
+            resp = supabase.table('influencers').select('creator_group_id').eq('username', ig_username).execute()
+            if resp.data and resp.data[0].get('creator_group_id'):
+                group_id = resp.data[0]['creator_group_id']
+
+        if not group_id and yt_channel_id:
+            resp = supabase.table('youtube_creators').select('creator_group_id').eq('channel_id', yt_channel_id).execute()
+            if resp.data and resp.data[0].get('creator_group_id'):
+                group_id = resp.data[0]['creator_group_id']
+
+        if not group_id and li_profile_id:
+            resp = supabase.table('linkedin_creators').select('creator_group_id').eq('profile_id', li_profile_id).execute()
+            if resp.data and resp.data[0].get('creator_group_id'):
+                group_id = resp.data[0]['creator_group_id']
+
+        # If no existing group, create a new one
+        if not group_id:
+            group_id = str(uuid.uuid4())
+
+        # Set the group_id on all provided profiles
+        if ig_username:
+            supabase.table('influencers').update({'creator_group_id': group_id}).eq('username', ig_username).execute()
+        if yt_channel_id:
+            supabase.table('youtube_creators').update({'creator_group_id': group_id}).eq('channel_id', yt_channel_id).execute()
+        if li_profile_id:
+            supabase.table('linkedin_creators').update({'creator_group_id': group_id}).eq('profile_id', li_profile_id).execute()
+
+        audit_log('LINK', 'creator_links', group_id, {
+            'instagram': ig_username, 'youtube': yt_channel_id, 'linkedin': li_profile_id
+        }, source='dashboard')
+
+        return jsonify({
+            'creator_group_id': group_id,
+            'message': 'Profiles linked successfully!'
+        })
+    except Exception as e:
+        logger.error(f"API /link-profiles Error: {e}")
+        return jsonify({'error': 'Linking failed', 'details': str(e)}), 500
+
+
+@api_bp.route('/unlink-profile', methods=['POST'])
+def unlink_profile():
+    """Remove a profile from its link group by setting creator_group_id to NULL.
+
+    Body: { platform: 'instagram'|'youtube'|'linkedin', identifier: 'username_or_id' }
+    """
+    data = request.get_json()
+    platform = data.get('platform', '').strip().lower()
+    identifier = data.get('identifier', '').strip()
+
+    if not platform or not identifier:
+        return jsonify({'error': 'platform and identifier are required'}), 400
+
+    try:
+        if platform == 'instagram':
+            supabase.table('influencers').update({'creator_group_id': None}).eq('username', identifier).execute()
+        elif platform == 'youtube':
+            supabase.table('youtube_creators').update({'creator_group_id': None}).eq('channel_id', identifier).execute()
+        elif platform == 'linkedin':
+            supabase.table('linkedin_creators').update({'creator_group_id': None}).eq('profile_id', identifier).execute()
+        else:
+            return jsonify({'error': f'Unknown platform: {platform}'}), 400
+
+        audit_log('UNLINK', 'creator_links', identifier, {'platform': platform}, source='dashboard')
+        return jsonify({'message': f'{platform} profile unlinked successfully'})
+    except Exception as e:
+        logger.error(f"API /unlink-profile Error: {e}")
+        return jsonify({'error': 'Unlinking failed', 'details': str(e)}), 500
+
+
+@api_bp.route('/linked-profiles/<group_id>', methods=['GET'])
+def get_linked_profiles(group_id):
+    """Get all profiles linked by a creator_group_id."""
+    try:
+        ig = supabase.table('influencers').select('username,creator_name,followers,profile_link').eq('creator_group_id', group_id).execute()
+        yt = supabase.table('youtube_creators').select('channel_id,channel_name,subscribers,profile_link').eq('creator_group_id', group_id).execute()
+        li = supabase.table('linkedin_creators').select('profile_id,full_name,headline,profile_link').eq('creator_group_id', group_id).execute()
+
+        return jsonify({
+            'creator_group_id': group_id,
+            'instagram': ig.data,
+            'youtube': yt.data,
+            'linkedin': li.data,
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
