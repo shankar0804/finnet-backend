@@ -11,7 +11,12 @@ import os
 import re
 import logging
 from datetime import datetime, timezone
-from services.scraper_service import _run_apify_actor, InsufficientDataError
+from services.scraper_service import (
+    _run_apify_actor,
+    InsufficientDataError,
+    _robust_mean,
+    _round_to_sig_figs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,38 +78,40 @@ def _calculate_video_metrics(videos: list) -> dict:
 
     Uses IQR outlier removal on views for avg_views calculation.
     """
-    # Filter to videos with view data
-    valid = [v for v in videos if (v.get('viewCount') or 0) > 0]
+    # Filter to videos with view data. Fall back across the fields YouTube's
+    # Apify actors use so we don't drop items that report views under an
+    # alternate key.
+    def _yt_view(item):
+        for key in ('viewCount', 'views', 'videoViewCount'):
+            val = item.get(key)
+            if val is None:
+                continue
+            try:
+                n = int(val)
+                if n > 0:
+                    return n
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    valid = [v for v in videos if _yt_view(v) > 0]
     views_count = len(valid)
 
     if views_count == 0:
         return {'avg_views': 0, 'engagement_rate': 0.0, 'avg_video_length': 0, '_views_count': 0}
 
-    # ── Avg Views with IQR ──
-    views = sorted([v['viewCount'] for v in valid])
-    n = len(views)
-
-    if n >= 4:
-        q1 = views[n // 4]
-        q3 = views[(3 * n) // 4]
-        iqr = q3 - q1
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-        filtered_views = [v for v in views if lower <= v <= upper]
-        if not filtered_views:
-            filtered_views = views
-    elif n > 2:
-        filtered_views = views[1:-1]
-    else:
-        filtered_views = views
-
-    avg_views = int(sum(filtered_views) / len(filtered_views)) if filtered_views else 0
+    # ── Avg Views (robust mean + 3-sig-fig rounding) ──
+    # Shared helpers live in scraper_service — proper quartiles, heavy-tail
+    # guard, and sensible rounding that doesn't snap to the nearest 50K.
+    view_counts = [_yt_view(v) for v in valid]
+    avg_views_raw = _robust_mean(view_counts)
+    avg_views = _round_to_sig_figs(avg_views_raw, sig_figs=3)
 
     # ── Engagement Rate ──
     total_engagements = 0
     total_views_for_er = 0
     for v in valid:
-        vw = v.get('viewCount', 0) or 0
+        vw = _yt_view(v)
         likes = v.get('likes', 0) or 0
         comments = v.get('commentsCount', 0) or 0
         total_engagements += likes + comments

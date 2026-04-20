@@ -2,7 +2,14 @@ from flask import Blueprint, request, jsonify, session
 from services.scraper_service import fetch_influencer_data, InsufficientDataError
 from services.youtube_scraper_service import fetch_youtube_data
 from services.linkedin_scraper_service import fetch_linkedin_data
-from services.ocr_service import run_ocr_pipeline
+from services.ocr_service import run_ocr_pipeline, run_post_ocr_pipeline
+from services.post_scraper_service import (
+    fetch_post_data,
+    detect_platform,
+    UnsupportedPlatformError,
+    PostNotFoundError,
+)
+from services.entry_builder_service import build_entry
 from services.sheets_service import sync_to_google_sheet
 from database.db import supabase
 import traceback
@@ -1584,33 +1591,139 @@ def list_entries(cid, current_user=None):
         return jsonify({'error': str(e)}), 500
 
 
+def _extract_entry_form(req) -> dict:
+    """Read entry form fields from either a multipart form or JSON body."""
+    if req.content_type and req.content_type.startswith('multipart/'):
+        src = req.form
+        def _get(k, default=''):
+            v = src.get(k)
+            return v if v is not None else default
+    else:
+        src = req.get_json(silent=True) or {}
+        def _get(k, default=''):
+            return src.get(k, default)
+
+    amount_raw = _get('amount', 0)
+    try:
+        amount = float(amount_raw) if amount_raw not in (None, '', 0) else 0
+    except (TypeError, ValueError):
+        amount = 0
+
+    return {
+        'campaign_id': (_get('campaign_id') or '').strip(),
+        'content_link': (_get('content_link') or '').strip(),
+        'creator_username': (_get('creator_username') or '').lstrip('@').strip(),
+        'deliverable_type': _get('deliverable_type') or '',
+        'amount': amount,
+        'delivery_date': _get('delivery_date') or None,
+        'poc': (_get('poc') or '').strip(),
+        'notes': (_get('notes') or '').strip(),
+    }
+
+
 @api_bp.route('/entries', methods=['POST'])
 @require_auth
 def create_entry(current_user=None):
+    """Create a campaign entry from a content link, a screenshot, or both.
+
+    Request shapes:
+      * JSON: {campaign_id, content_link?, creator_username?, deliverable_type?,
+               amount?, delivery_date?, poc?, notes?}
+      * multipart/form-data: same fields as form keys + optional `screenshot`
+        file (image). When both a link and a screenshot are supplied, the
+        scrape runs first and OCR fills whichever fields the scrape missed.
+
+    A creator_username + at least one of (content_link, screenshot, DB lookup
+    hit) is required. If the creator is not in the DB and the scrape didn't
+    include enough info to auto-add them, the entry is skipped and the caller
+    gets a 202 with a human-readable reason.
+    """
     if current_user.get('role') not in ('admin', 'senior'):
         return jsonify({'error': 'Access denied'}), 403
-    try:
-        data = request.get_json(silent=True) or {}
-        username = (data.get('creator_username') or '').strip()
-        cid = data.get('campaign_id', '')
-        if not username or not cid:
-            return jsonify({'error': 'creator_username and campaign_id are required'}), 400
-        row = {
-            'campaign_id': cid,
-            'creator_username': username,
-            'deliverable_type': data.get('deliverable_type', 'Reel'),
-            'status': data.get('status', 'pending'),
-            'content_link': data.get('content_link', ''),
-            'notes': data.get('notes', ''),
-            'amount': data.get('amount', 0),
-            'delivery_date': data.get('delivery_date') or None,
-            'poc': data.get('poc', ''),
-        }
-        resp = supabase.table('campaign_entries').insert(row).execute()
-        audit_log('INSERT', 'campaign_entries', username, {'campaign_id': cid}, source='dashboard')
-        return jsonify(resp.data[0] if resp.data else {'success': True}), 201
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+
+    form = _extract_entry_form(request)
+    cid = form['campaign_id']
+    link = form['content_link']
+    screenshot = request.files.get('screenshot') if request.files else None
+
+    if not cid:
+        return jsonify({'error': 'campaign_id is required'}), 400
+    if not link and not screenshot and not form['creator_username']:
+        return jsonify({
+            'error': 'Provide a content link, a screenshot, or at least a creator username.'
+        }), 400
+
+    scraped = None
+    ocr_result = None
+    platform_hint = None
+
+    # 1. Scrape from link (if provided)
+    if link:
+        try:
+            platform_hint = detect_platform(link)
+        except UnsupportedPlatformError as e:
+            return jsonify({'error': str(e)}), 400
+
+        if not _acquire_scrape_slot():
+            return jsonify({
+                'error': 'Scraper busy',
+                'details': f'All {SCRAPE_MAX} scraper slots are currently busy. Try again shortly.'
+            }), 503
+        try:
+            scraped = fetch_post_data(link)
+        except PostNotFoundError as e:
+            logger.warning(f'[ENTRY] Post scrape returned nothing for {link}: {e}')
+        except UnsupportedPlatformError as e:
+            return jsonify({'error': str(e)}), 400
+        except Exception as e:
+            logger.error(f'[ENTRY] Post scrape failed for {link}: {e}')
+            # Don't fail the whole request — OCR or creator_username may carry us.
+        finally:
+            _release_scrape_slot()
+
+    # 2. Run OCR on screenshot (if provided) — fills the gaps left by the scrape.
+    if screenshot is not None:
+        try:
+            image_bytes = screenshot.read()
+            if image_bytes:
+                ocr_result = run_post_ocr_pipeline(image_bytes)['result']
+        except Exception as e:
+            logger.warning(f'[ENTRY] OCR failed: {e}')
+            # Non-fatal — we can still build from scrape / form.
+
+    # 3. Hand off to the builder
+    result = build_entry(
+        campaign_id=cid,
+        scraped=scraped,
+        ocr=ocr_result,
+        overrides=form,
+        platform_hint=platform_hint,
+    )
+
+    if result.get('status') == 'created':
+        audit_log(
+            'INSERT', 'campaign_entries',
+            (result.get('entry') or {}).get('creator_username', ''),
+            {
+                'campaign_id': cid,
+                'platform': result.get('platform'),
+                'data_source': (result.get('entry') or {}).get('data_source'),
+                'reverse_updated_creator_fields': result.get('updated_creator_fields', []),
+            },
+            source='dashboard',
+        )
+        return jsonify(result.get('entry') or {'success': True}), 201
+
+    if result.get('status') == 'skipped':
+        # 202 Accepted-but-not-stored; frontend renders the reason.
+        return jsonify({
+            'skipped': True,
+            'reason': result.get('reason'),
+            'missing_creator': result.get('missing_creator'),
+            'platform': result.get('platform'),
+        }), 202
+
+    return jsonify({'error': result.get('reason', 'Unknown error')}), 500
 
 
 @api_bp.route('/entries/<eid>', methods=['PUT'])
@@ -1644,92 +1757,150 @@ def delete_entry(eid, current_user=None):
         return jsonify({'error': str(e)}), 500
 
 
+def _fetch_google_sheet_rows(sheet_url: str) -> list:
+    """Turn a public Google Sheet URL into a list of dict rows (first-row headers)."""
+    import re, csv, io, requests as req
+    match = re.search(r'/d/([a-zA-Z0-9_-]+)', sheet_url)
+    if not match:
+        raise ValueError('Invalid Google Sheet URL. Share the sheet as "Anyone with the link".')
+    sheet_id = match.group(1)
+    gid_match = re.search(r'gid=(\d+)', sheet_url)
+    gid = gid_match.group(1) if gid_match else '0'
+    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    logger.info(f"[SHEET IMPORT] Fetching CSV from: {csv_url}")
+    resp = req.get(csv_url, timeout=30)
+    if resp.status_code != 200:
+        raise ValueError(
+            f'Failed to fetch sheet (HTTP {resp.status_code}). '
+            'Make sure sharing is set to "Anyone with the link".'
+        )
+    reader = csv.DictReader(io.StringIO(resp.text))
+    return list(reader)
+
+
 @api_bp.route('/campaigns/<cid>/import-sheet', methods=['POST'])
 @require_auth
 def import_sheet_entries(cid, current_user=None):
-    """Bulk import campaign entries from a Google Sheet URL or JSON array."""
+    """Bulk import campaign entries from a Google Sheet URL or JSON array.
+
+    Each row is processed through the same scrape+OCR+build_entry pipeline
+    as the single-entry endpoint, so a row with a `link` column gets fully
+    enriched and a row whose creator isn't in the DB (without rescue data)
+    is returned under `skipped` instead of quietly dropping.
+    """
+    from services.bulk_entries_service import process_rows
+
     if current_user.get('role') not in ('admin', 'senior'):
         return jsonify({'error': 'Access denied'}), 403
     try:
         data = request.get_json(silent=True) or {}
         sheet_url = (data.get('sheet_url') or '').strip()
-        rows = data.get('rows') or []
+        raw_rows = data.get('rows') or []
 
-        if not sheet_url and not rows:
+        if not sheet_url and not raw_rows:
             return jsonify({'error': 'Provide either a Google Sheet URL or a rows array'}), 400
 
-        # If sheet_url is provided, fetch and parse the CSV
-        if sheet_url and not rows:
-            import re, csv, io, requests as req
-            # Extract the Google Sheet ID
-            match = re.search(r'/d/([a-zA-Z0-9_-]+)', sheet_url)
-            if not match:
-                return jsonify({'error': 'Invalid Google Sheet URL. Share the sheet as "Anyone with the link".'}), 400
-            sheet_id = match.group(1)
-            # Check for gid (tab ID)
-            gid_match = re.search(r'gid=(\d+)', sheet_url)
-            gid = gid_match.group(1) if gid_match else '0'
-            csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-            logger.info(f"[SHEET IMPORT] Fetching CSV from: {csv_url}")
-            resp = req.get(csv_url, timeout=30)
-            if resp.status_code != 200:
-                return jsonify({'error': f'Failed to fetch sheet (HTTP {resp.status_code}). Make sure sharing is set to "Anyone with the link".'}), 400
-            reader = csv.DictReader(io.StringIO(resp.text))
-            rows = list(reader)
-            logger.info(f"[SHEET IMPORT] Parsed {len(rows)} rows from sheet")
+        if sheet_url and not raw_rows:
+            try:
+                raw_rows = _fetch_google_sheet_rows(sheet_url)
+            except ValueError as ve:
+                return jsonify({'error': str(ve)}), 400
+            logger.info(f"[SHEET IMPORT] Parsed {len(raw_rows)} rows from sheet")
 
-        # Map column names to campaign_entries fields
-        FIELD_MAP = {
-            'creator_username': ['creator_username', 'username', 'creator', 'handle', 'ig_handle', 'instagram'],
-            'deliverable_type': ['deliverable_type', 'deliverable', 'type', 'content_type', 'asset'],
-            'status': ['status'],
-            'content_link': ['content_link', 'live_link', 'link', 'post_link', 'url'],
-            'notes': ['notes', 'note', 'remarks'],
-            'amount': ['amount', 'commercials', 'fee', 'cost', 'budget', 'price'],
-            'delivery_date': ['delivery_date', 'date', 'due_date', 'deadline'],
-            'poc': ['poc', 'point_of_contact', 'assigned_to'],
-        }
+        rows = [{'row': i + 2, 'data': r, 'images': []} for i, r in enumerate(raw_rows)]
 
-        def map_row(raw):
-            mapped = {'campaign_id': cid}
-            # Normalize keys to lowercase
-            normed = {k.strip().lower().replace(' ', '_'): v for k, v in raw.items() if k}
-            for field, aliases in FIELD_MAP.items():
-                for alias in aliases:
-                    if alias in normed and normed[alias]:
-                        val = str(normed[alias]).strip()
-                        if field == 'amount':
-                            try:
-                                val = float(val.replace(',', '').replace('₹', '').replace('$', ''))
-                            except (ValueError, TypeError):
-                                val = 0
-                        mapped[field] = val
-                        break
-            return mapped
-
-        entries = [map_row(r) for r in rows]
-        # Filter out rows without creator_username
-        entries = [e for e in entries if e.get('creator_username')]
-        if not entries:
-            return jsonify({'error': 'No valid rows found. Sheet must have a "creator_username" or "username" column.'}), 400
-
-        # Set defaults
-        for e in entries:
-            e.setdefault('deliverable_type', 'Reel')
-            e.setdefault('status', 'pending')
-            e.setdefault('content_link', '')
-            e.setdefault('notes', '')
-            e.setdefault('amount', 0)
-            e.setdefault('poc', '')
-
-        # Bulk insert
-        resp = supabase.table('campaign_entries').insert(entries).execute()
-        count = len(resp.data) if resp.data else 0
-        audit_log('BULK_INSERT', 'campaign_entries', cid, {'count': count, 'source': 'sheet_import'}, source='dashboard')
-        logger.info(f"[SHEET IMPORT] ✅ Imported {count} entries into campaign {cid}")
-        return jsonify({'imported': count, 'entries': resp.data}), 201
+        summary = process_rows(
+            campaign_id=cid,
+            rows=rows,
+            scrape_acquire=_acquire_scrape_slot,
+            scrape_release=_release_scrape_slot,
+        )
+        audit_log(
+            'BULK_INSERT', 'campaign_entries', cid,
+            {
+                'created': summary['created'],
+                'skipped': len(summary['skipped']),
+                'failed': len(summary['failed']),
+                'source': 'sheet_import',
+            },
+            source='dashboard',
+        )
+        logger.info(
+            f"[SHEET IMPORT] Done — created={summary['created']} "
+            f"skipped={len(summary['skipped'])} failed={len(summary['failed'])}"
+        )
+        return jsonify({
+            'imported': summary['created'],
+            'skipped': summary['skipped'],
+            'failed': summary['failed'],
+            'total': summary['total'],
+        }), 201
     except Exception as e:
-        logger.error(f"[SHEET IMPORT] ❌ Error: {traceback.format_exc()}")
+        logger.error(f"[SHEET IMPORT] Error: {traceback.format_exc()}")
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/campaigns/<cid>/import-excel', methods=['POST'])
+@require_auth
+def import_excel_entries(cid, current_user=None):
+    """Bulk import campaign entries from an uploaded .xlsx file.
+
+    Each row may carry a `link` column AND/OR one or more images embedded
+    inside the row's cells. We scrape the link, OCR the first image as a
+    gap-filler, and let entry_builder_service.build_entry insert.
+    """
+    from services.bulk_entries_service import parse_xlsx_with_images, process_rows
+
+    if current_user.get('role') not in ('admin', 'senior'):
+        return jsonify({'error': 'Access denied'}), 403
+
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded. Send the workbook as multipart field "file".'}), 400
+
+    file = request.files['file']
+    if not file or not file.filename:
+        return jsonify({'error': 'Empty file.'}), 400
+    if not file.filename.lower().endswith('.xlsx'):
+        return jsonify({'error': 'Only .xlsx is supported. Convert older formats first.'}), 400
+
+    try:
+        rows = parse_xlsx_with_images(file.read())
+    except Exception as e:
+        logger.error(f"[EXCEL IMPORT] parse failed: {traceback.format_exc()}")
+        return jsonify({'error': f'Could not read workbook: {e}'}), 400
+
+    if not rows:
+        return jsonify({'error': 'No data rows found in the first sheet.'}), 400
+
+    try:
+        summary = process_rows(
+            campaign_id=cid,
+            rows=rows,
+            scrape_acquire=_acquire_scrape_slot,
+            scrape_release=_release_scrape_slot,
+        )
+        audit_log(
+            'BULK_INSERT', 'campaign_entries', cid,
+            {
+                'created': summary['created'],
+                'skipped': len(summary['skipped']),
+                'failed': len(summary['failed']),
+                'source': 'excel_import',
+            },
+            source='dashboard',
+        )
+        logger.info(
+            f"[EXCEL IMPORT] Done — created={summary['created']} "
+            f"skipped={len(summary['skipped'])} failed={len(summary['failed'])}"
+        )
+        return jsonify({
+            'imported': summary['created'],
+            'skipped': summary['skipped'],
+            'failed': summary['failed'],
+            'total': summary['total'],
+        }), 201
+    except Exception as e:
+        logger.error(f"[EXCEL IMPORT] Error: {traceback.format_exc()}")
         return jsonify({'error': str(e)}), 500
 
 # ═══════════════════════════════════════════════════════════

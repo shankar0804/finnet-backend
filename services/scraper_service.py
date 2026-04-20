@@ -1,6 +1,8 @@
 import os
 import time
 import json
+import math
+import statistics
 import requests
 import urllib3
 import logging
@@ -24,6 +26,105 @@ class InsufficientDataError(Exception):
 
 
 # ═══════════════════════════════════════════════════════════
+# Shared numeric helpers (also used by youtube_scraper_service)
+# ═══════════════════════════════════════════════════════════
+
+# Preference order for Instagram view/play count fields. Apify returns a mix
+# depending on whether the data came from the profile scraper or the reel
+# scraper, and some reels only have one of the two populated.
+_IG_VIEW_FIELDS = ("videoViewCount", "videoPlayCount", "playsCount", "viewCount")
+
+
+def _pick_view_count(item: dict, fields: tuple = _IG_VIEW_FIELDS) -> int:
+    """Return the first positive view/play count available on the item.
+
+    Falling back across fields avoids silently dropping reels that only have
+    `videoPlayCount` populated (common with the profile scraper)."""
+    for key in fields:
+        val = item.get(key)
+        if val is not None:
+            try:
+                n = int(val)
+                if n > 0:
+                    return n
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def _robust_mean(values: list) -> float:
+    """Return a robust mean of positive view counts.
+
+    Strategy:
+      * n >= 6  → IQR outlier removal using proper linear-interpolation
+                  quartiles (statistics.quantiles, n=4, inclusive method).
+      * 3 <= n < 6 → trim the single highest and single lowest (classic
+                  trimmed mean — IQR is unreliable with so few points).
+      * n < 3   → plain arithmetic mean.
+
+    Final sanity check: if the arithmetic mean is more than 2× the median,
+    a heavy-tail outlier survived the trimming — fall back to the median
+    so one viral video can't double the reported average."""
+    vals = []
+    for v in values:
+        try:
+            x = float(v)
+            if x > 0:
+                vals.append(x)
+        except (TypeError, ValueError):
+            continue
+
+    n = len(vals)
+    if n == 0:
+        return 0.0
+
+    if n >= 6:
+        try:
+            q1, _med, q3 = statistics.quantiles(vals, n=4, method="inclusive")
+            iqr = q3 - q1
+            lo = q1 - 1.5 * iqr
+            hi = q3 + 1.5 * iqr
+            trimmed = [v for v in vals if lo <= v <= hi]
+        except statistics.StatisticsError:
+            trimmed = vals
+    elif n >= 3:
+        s = sorted(vals)
+        trimmed = s[1:-1]
+    else:
+        trimmed = vals
+
+    if not trimmed:
+        trimmed = vals
+
+    mean = sum(trimmed) / len(trimmed)
+    median = statistics.median(vals)
+    # Heavy-tail guard: if mean is still more than 2× the median, one
+    # outlier survived IQR. Prefer the median — it's far more stable.
+    if median > 0 and mean > 2 * median:
+        return float(median)
+    return mean
+
+
+def _round_to_sig_figs(value: float, sig_figs: int = 3) -> int:
+    """Round a positive number to `sig_figs` significant figures.
+
+    Keeps the answer honest while still being display-friendly:
+        127_432   → 127_000  (vs. old 150_000)
+        1_540_217 → 1_540_000
+        27_400    → 27_400
+        8_340     → 8_340
+    """
+    if value is None or value <= 0:
+        return 0
+    try:
+        magnitude = math.floor(math.log10(value))
+        factor = 10 ** (magnitude - sig_figs + 1)
+        return int(round(value / factor) * factor)
+    except (ValueError, OverflowError):
+        return int(round(value))
+
+
+# ═══════════════════════════════════════════════════════════
 # Shared Metrics Calculator
 # ═══════════════════════════════════════════════════════════
 
@@ -37,45 +138,22 @@ def _calculate_metrics(target_reels: list, source: str = "profile") -> dict:
     Returns dict with: avg_views, engagement_rate, avg_video_length
     """
 
-    # --- Avg Views with IQR Outlier Removal ---
-    # Goal: Find the "typical" view range, ignoring viral spikes and dead posts
-    views = [r.get("videoViewCount", 0) for r in target_reels if r.get("videoViewCount", 0) > 0]
+    # --- Avg Views (robust mean + 3-sig-fig rounding) ---
+    # Gather per-reel view counts, falling back across field names so reels
+    # that only have `videoPlayCount` populated are not dropped.
+    views = [_pick_view_count(r) for r in target_reels]
+    views = [v for v in views if v > 0]
 
-    if len(views) >= 4:
-        # IQR method: remove statistical outliers (both high and low)
-        views_sorted = sorted(views)
-        n = len(views_sorted)
-        q1 = views_sorted[n // 4]           # 25th percentile
-        q3 = views_sorted[(3 * n) // 4]     # 75th percentile
-        iqr = q3 - q1
-        lower_bound = q1 - 1.5 * iqr
-        upper_bound = q3 + 1.5 * iqr
-        valid_views = [v for v in views_sorted if lower_bound <= v <= upper_bound]
-        # Fallback: if IQR removes everything (all same value), use all
-        if not valid_views:
-            valid_views = views_sorted
-    elif len(views) > 2:
-        # Not enough for IQR, just drop highest and lowest
-        views_sorted = sorted(views)
-        valid_views = views_sorted[1:-1]
-    else:
-        valid_views = views
-
-    avg_views = (sum(valid_views) / len(valid_views)) if valid_views else 0
-    # Round to nearest 50K for >= 50K, nearest 10K for >= 10K, nearest 1K otherwise
-    if avg_views >= 50000:
-        avg_views = round(avg_views / 50000) * 50000
-    elif avg_views >= 10000:
-        avg_views = round(avg_views / 10000) * 10000
-    elif avg_views >= 1000:
-        avg_views = round(avg_views / 1000) * 1000
-    else:
-        avg_views = round(avg_views)
+    avg_views_raw = _robust_mean(views)
+    avg_views = _round_to_sig_figs(avg_views_raw, sig_figs=3)
 
     # --- Engagement Rate ---
+    # ER = (likes + comments) / views * 100, weighted by the *actual* views
+    # on each reel (not the trimmed mean). Uses the same fallback view field
+    # so we don't divide by zero when only playCount is available.
     total_views = sum(views)
-    total_likes = sum(r.get("likesCount", 0) for r in target_reels)
-    total_comments = sum(r.get("commentsCount", 0) for r in target_reels)
+    total_likes = sum((r.get("likesCount") or 0) for r in target_reels)
+    total_comments = sum((r.get("commentsCount") or 0) for r in target_reels)
     engagement_rate = 0.0
     if total_views > 0:
         engagement_rate = round(((total_likes + total_comments) / total_views) * 100, 2)
@@ -241,8 +319,11 @@ def fetch_influencer_data(username: str) -> dict:
 
     target_reels = reels[:10]
 
-    # 3. Check if we have enough reels — if not, fallback to reel scraper
-    usable_views = [r.get("videoViewCount", 0) for r in target_reels if r.get("videoViewCount", 0) > 0]
+    # 3. Check if we have enough reels — if not, fallback to reel scraper.
+    # Use the same field-fallback logic as the metric calculator, otherwise
+    # we'd miss reels where only videoPlayCount is populated.
+    usable_views = [_pick_view_count(r) for r in target_reels]
+    usable_views = [v for v in usable_views if v > 0]
     data_source = "profile"
 
     if len(usable_views) < MIN_REELS_FOR_METRICS:
