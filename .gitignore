@@ -37,3 +37,7 @@ win-venv/
 **/__pycache__/
 client_secrets.json
 service_account.json
+
+# Frontend is a separate repo (finnet-frontend) — never commit to backend
+frontend/
+_frontend_deploy/
