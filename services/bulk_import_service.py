@@ -171,7 +171,9 @@ def _get_existing_creators(usernames: list[str]) -> dict:
 
 
 def process_sheet(sheet_url: str = None, file_bytes: bytes = None,
-                  file_name: str = None, progress_callback=None) -> dict:
+                  file_name: str = None, progress_callback=None,
+                  is_cancelled=None, apply_to_all: dict = None,
+                  scrape_acquire=None, scrape_release=None) -> dict:
     """
     Main entry point. Reads sheet, validates, scrapes, and updates DB.
 
@@ -180,10 +182,26 @@ def process_sheet(sheet_url: str = None, file_bytes: bytes = None,
         file_bytes: Raw bytes of uploaded Excel/CSV file
         file_name: Original filename (for format detection)
         progress_callback: Optional callable(message: str) for progress updates
+        is_cancelled: Optional callable() -> bool. Checked between rows; when
+            True, the worker aborts gracefully and returns a partial report.
+        apply_to_all: Optional dict of {db_field: value} that should be applied
+            as DEFAULTS to every imported row. Used when the user sends the
+            sheet link alongside metadata like "managed by Finnet" in a single
+            message. Sheet column values ALWAYS win over these defaults.
+        scrape_acquire / scrape_release: Optional callables that gate each
+            Apify call on the global scrape semaphore. When provided, each
+            row waits for a free scraper slot before hitting Apify — keeps
+            bulk imports from starving interactive users.
 
     Returns:
         Report dict with imported/skipped/errors
     """
+    # Sanitize apply_to_all: only keep MANUAL_FIELDS with non-empty string values
+    defaults: dict = {}
+    if apply_to_all and isinstance(apply_to_all, dict):
+        for k, v in apply_to_all.items():
+            if k in MANUAL_FIELDS and v is not None and str(v).strip():
+                defaults[k] = str(v).strip()
     def notify(msg):
         if progress_callback:
             try:
@@ -191,6 +209,14 @@ def process_sheet(sheet_url: str = None, file_bytes: bytes = None,
             except Exception:
                 pass
         logger.info(f"[BULK] {msg}")
+
+    def _cancelled():
+        if is_cancelled is None:
+            return False
+        try:
+            return bool(is_cancelled())
+        except Exception:
+            return False
 
     # ─── Step 1: Read the sheet ─────────────────────────────────
     try:
@@ -273,6 +299,10 @@ def process_sheet(sheet_url: str = None, file_bytes: bytes = None,
                 if _is_clear_percentage(val):
                     manual_data[db_field] = str(val).strip()
 
+        # ── Apply caller-supplied defaults (sheet values ALWAYS win) ──
+        for k, v in defaults.items():
+            manual_data.setdefault(k, v)
+
         valid_rows.append({
             "row": row_num,
             "name": name,
@@ -304,6 +334,10 @@ def process_sheet(sheet_url: str = None, file_bytes: bytes = None,
     MANDATORY_FOR_NEW = {"niche", "language", "gender"}
 
     for i, row_data in enumerate(valid_rows):
+        if _cancelled():
+            notify(f"🛑 Cancelled by user. Stopped at {i}/{total}.")
+            break
+
         username = row_data["username"]
         name = row_data["name"]
         manual_data = row_data["manual_data"]
@@ -356,12 +390,24 @@ def process_sheet(sheet_url: str = None, file_bytes: bytes = None,
             })
             continue
 
-        # Scrape the profile
+        # Scrape the profile — respect the global scrape semaphore if caller
+        # provided one. Keeps bulk imports from monopolising Apify slots.
         try:
             notify(f"🔍 Scraping @{username}... ({i+1}/{total})")
-            scraped = fetch_influencer_data(username)
+            acquired_slot = False
+            if scrape_acquire is not None:
+                acquired_slot = bool(scrape_acquire())
+                if not acquired_slot:
+                    raise RuntimeError("Scraper slot timed out — try again later")
+            try:
+                scraped = fetch_influencer_data(username)
+            finally:
+                if acquired_slot and scrape_release is not None:
+                    try:
+                        scrape_release()
+                    except Exception:
+                        pass
 
-            # Merge: scraped data + manual data from sheet
             merged = {**scraped}
             for field, value in manual_data.items():
                 merged[field] = value
@@ -389,14 +435,19 @@ def process_sheet(sheet_url: str = None, file_bytes: bytes = None,
             })
 
     # ─── Step 6: Build report ───────────────────────────────────
+    cancelled_flag = _cancelled()
     report = {
         "total_rows": len(df),
         "imported": len(imported),
         "skipped": skipped_rows + skipped_existing,
         "errors": errors,
         "imported_details": imported,
+        "cancelled": cancelled_flag,
     }
 
-    notify(f"🏁 Done! ✅ {len(imported)} imported, ❌ {len(skipped_rows) + len(skipped_existing)} skipped, ⚠️ {len(errors)} errors")
+    if cancelled_flag:
+        notify(f"🛑 Cancelled. ✅ {len(imported)} imported, ❌ {len(skipped_rows) + len(skipped_existing)} skipped, ⚠️ {len(errors)} errors (before stop)")
+    else:
+        notify(f"🏁 Done! ✅ {len(imported)} imported, ❌ {len(skipped_rows) + len(skipped_existing)} skipped, ⚠️ {len(errors)} errors")
 
     return report

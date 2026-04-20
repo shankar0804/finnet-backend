@@ -1,21 +1,36 @@
-import json
 import re
 import time
 import sqlite3
 import logging
-import pandas as pd
+import threading
+from collections import OrderedDict
 from openai import OpenAI
 from database.db import supabase
 
 logger = logging.getLogger(__name__)
 
-# ── Data cache to avoid fetching from Supabase on every query ──
-_cache = {"ig": None, "yt": None, "li": None, "timestamp": 0}
-CACHE_TTL = 60  # seconds
-
 import os
 
 NVIDIA_KEY = os.environ.get("NVIDIA_KEY", "").strip()
+
+# ── Persistent in-memory SQLite per platform ──
+# We keep ONE sqlite connection per platform alive for the process lifetime.
+# A lazy refresh re-populates the table when CACHE_TTL expires — without
+# rebuilding the schema or re-materializing pandas DataFrames per query.
+# Significant CPU/RAM win vs. the old per-request sqlite + to_sql path.
+CACHE_TTL = int(os.environ.get("MCP_CACHE_TTL", "60"))
+_DB_LOCK = threading.Lock()
+_DB_CONNS: dict = {}          # platform -> sqlite3.Connection
+_DB_LAST_REFRESH: dict = {}   # platform -> epoch seconds
+
+# ── Result cache for identical recent questions ──
+# Key: (platform, normalized_query). Value: (expiry_ts, result_dict).
+# Saves the LLM + SQL round-trip when the same question is asked twice
+# within RESULT_CACHE_TTL seconds.
+RESULT_CACHE_TTL = int(os.environ.get("MCP_RESULT_CACHE_TTL", "30"))
+_RESULT_CACHE_MAX = 64
+_RESULT_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_RESULT_CACHE_LOCK = threading.Lock()
 
 # Schema definitions — all three platform tables
 SCHEMA_IG = {
@@ -130,6 +145,97 @@ SCHEMA_LI = {
 
 ALLOWED_TABLES = {'INFLUENCERS', 'YOUTUBE_CREATORS', 'LINKEDIN_CREATORS'}
 
+# ─── Platform signal detection ────────────────────────────────────
+# We use simple keyword matching to infer which platform the user means.
+# If NONE of these signals is found, we return a `clarify` response and
+# the bot asks the user to pick one.
+IG_KEYWORDS = {
+    'instagram', 'insta', 'ig', 'reel', 'reels', 'post', 'posts',
+    'followers', 'avg views', 'avg_views', 'average views',
+    'influencer', 'influencers',
+}
+YT_KEYWORDS = {
+    'youtube', 'yt', 'channel', 'channels', 'subscriber', 'subscribers',
+    'subs', 'short', 'shorts', 'long-form', 'longform', 'video views',
+    'watch time', 'ctr',
+}
+LI_KEYWORDS = {
+    'linkedin', 'li', 'connection', 'connections', 'company', 'companies',
+    'headline', 'professional', 'employee', 'industry',
+}
+
+
+def detect_platform(user_query: str):
+    """Return 'instagram' | 'youtube' | 'linkedin' | None based on keywords.
+
+    We tokenize on word boundaries so we don't match "ig" inside "strategic".
+    """
+    if not user_query:
+        return None
+    text = f' {user_query.lower()} '
+    scores = {'instagram': 0, 'youtube': 0, 'linkedin': 0}
+    for kw in IG_KEYWORDS:
+        if re.search(rf'(?<![A-Za-z]){re.escape(kw)}(?![A-Za-z])', text):
+            scores['instagram'] += 1
+    for kw in YT_KEYWORDS:
+        if re.search(rf'(?<![A-Za-z]){re.escape(kw)}(?![A-Za-z])', text):
+            scores['youtube'] += 1
+    for kw in LI_KEYWORDS:
+        if re.search(rf'(?<![A-Za-z]){re.escape(kw)}(?![A-Za-z])', text):
+            scores['linkedin'] += 1
+
+    best = max(scores, key=scores.get)
+    if scores[best] == 0:
+        return None
+    # Tie-breaking: if two platforms tie, we can't decide → ask
+    sorted_scores = sorted(scores.values(), reverse=True)
+    if len(sorted_scores) >= 2 and sorted_scores[0] == sorted_scores[1] and sorted_scores[0] > 0:
+        return None
+    return best
+
+
+# ─── Query sanity patches (safety net for the LLM) ────────────────
+_WORD_COUNTS = {
+    'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+    'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+}
+
+
+def _extract_limit_from_query(q: str):
+    """Return an integer N if the user asked for 'N creators / give me N / top N / first N', else None."""
+    if not q:
+        return None
+    ql = q.lower()
+    # "top 3" / "first 5" / "only 10"
+    m = re.search(r'\b(?:top|first|only|last|latest)\s+(\d{1,4})\b', ql)
+    if m:
+        return int(m.group(1))
+    # "give/show/find/list me 3" or "3 creators/channels/profiles"
+    m = re.search(r'\b(?:give|show|list|find|fetch|get)\s+(?:me|us)?\s*(\d{1,4})\b', ql)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'\b(\d{1,4})\s+(?:creator|creators|channel|channels|profile|profiles|influencer|influencers|result|results|row|rows)\b', ql)
+    if m:
+        n = int(m.group(1))
+        if n <= 500:
+            return n
+    # "give me three creators"
+    m = re.search(r'\b(?:top|first|only|give|show|list)\s+(one|two|three|four|five|six|seven|eight|nine|ten)\b', ql)
+    if m:
+        return _WORD_COUNTS.get(m.group(1))
+    return None
+
+
+def _patch_sql_with_user_limit(sql: str, user_query: str) -> str:
+    """If the user asked for a specific count but the LLM forgot LIMIT, inject it."""
+    requested = _extract_limit_from_query(user_query)
+    if not requested:
+        return sql
+    if re.search(r'\bLIMIT\s+\d+', sql, re.IGNORECASE):
+        return sql
+    cleaned = sql.strip().rstrip(';').strip()
+    return f"{cleaned} LIMIT {requested}"
+
 # Build column listings for the prompt
 def _cols_str(schema):
     return "\n".join(f"  - {col} ({dtype})" for col, dtype in schema["columns"].items())
@@ -211,206 +317,339 @@ There are THREE tables. Choose the correct one based on the user's question:
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-**How to choose the table:**
-- If the user says "Instagram", "IG", "reel", "followers" → use `influencers`
-- If the user says "YouTube", "YT", "channel", "subscribers", "shorts", "long-form" → use `youtube_creators`
-- If the user says "LinkedIn", "LI", "connections", "company", "headline" → use `linkedin_creators`
-- If the user says "all creators" or "all platforms" or doesn't specify → use `influencers` (default)
-- You can query ONLY ONE table per query. Do NOT join tables.
-- The tables are linked by `creator_group_id` (same UUID = same person across platforms), but cross-table JOINs are NOT needed for most queries.
+**How to choose the table (VERY IMPORTANT):**
+- The user message will ALWAYS begin with an explicit "Platform:" hint — trust it.
+- If platform hint says "instagram" → use `influencers` (text values for followers/views).
+- If platform hint says "youtube"   → use `youtube_creators`.
+- If platform hint says "linkedin"  → use `linkedin_creators`.
+- Queries touch ONE table at a time. No JOINs.
 
 **Rules:**
 1. Write ONLY a single SELECT statement. No explanations, no markdown, no code fences.
 2. Use ONLY the columns listed above for the chosen table. Never invent columns.
 3. **DEFAULT columns** for Instagram queries: `creator_name, username, profile_link, niche, followers, avg_views`
-4. **DEFAULT columns** for YouTube queries: `channel_name, channel_handle, profile_link, niche, subscribers, avg_long_views, long_engagement_rate, avg_short_views, short_engagement_rate`
+4. **DEFAULT columns** for YouTube queries:  `channel_name, channel_handle, profile_link, niche, subscribers, avg_long_views, long_engagement_rate, avg_short_views, short_engagement_rate`
 5. **DEFAULT columns** for LinkedIn queries: `full_name, profile_id, profile_link, headline, current_company, connections`
 6. For text columns, empty/missing values may be NULL or empty string ''. Use: `(column IS NULL OR TRIM(column) = '')`
 7. For numeric columns, missing data is NULL or 0. To find valid data: `column IS NOT NULL AND column > 0`
 8. Use case-insensitive matching for text: `LOWER(column) LIKE LOWER('%value%')`
-9. Do NOT add a LIMIT unless the user says "top N" or a specific number.
-10. Output ONLY the raw SQL. Nothing else.
+9. **Number shorthand (CRITICAL)**:
+   - "500k" / "500K" means 500000. "1.2m" / "1.2M" means 1200000. "10b" means 10000000000.
+   - ALWAYS expand these in the SQL — never write `followers > 500`, write `followers > 500000`.
+10. **Count phrases (CRITICAL)**: If the user says "give me N", "show me N", "top N", "first N", "only N", or any variant specifying a count of creators, ALWAYS add `LIMIT N` to the query.
+11. **Threshold phrasing**:
+    - "above X" / "over X" / "more than X" → `column > X`
+    - "below X" / "under X" / "less than X" → `column < X`
+    - "at least X" → `column >= X`
+    - "between X and Y" → `column BETWEEN X AND Y`
+12. When the user mentions a count AND a threshold (e.g. "3 creators above 500k"), ALWAYS add both `WHERE column > <threshold>` and `ORDER BY column DESC LIMIT <count>`.
+13. **Default ordering**: when the query is about "top", "best", "biggest", or any size word, ORDER BY the primary metric DESC (followers / subscribers / connections).
+14. Output ONLY the raw SQL. Nothing else.
 
-**Examples:**
+**Examples (follow these PATTERNS exactly):**
 
-User: "show all creators"
+User: "Platform: instagram. show all creators"
 SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers
 
-User: "youtube creators with more than 100k subscribers"
-SELECT channel_name, channel_handle, profile_link, niche, subscribers, avg_long_views, long_engagement_rate FROM youtube_creators WHERE subscribers > 100000 ORDER BY subscribers DESC
+User: "Platform: instagram. Give me 3 creators above 500k"
+SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE followers IS NOT NULL AND followers > 500000 ORDER BY followers DESC LIMIT 3
 
-User: "show me youtube shorts engagement rates"
+User: "Platform: instagram. Show me 5 creators with more than 1M followers"
+SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE followers IS NOT NULL AND followers > 1000000 ORDER BY followers DESC LIMIT 5
+
+User: "Platform: instagram. Top 10 creators"
+SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE followers IS NOT NULL AND followers > 0 ORDER BY followers DESC LIMIT 10
+
+User: "Platform: youtube. youtube creators with more than 100k subscribers"
+SELECT channel_name, channel_handle, profile_link, niche, subscribers, avg_long_views, long_engagement_rate FROM youtube_creators WHERE subscribers IS NOT NULL AND subscribers > 100000 ORDER BY subscribers DESC
+
+User: "Platform: youtube. give me 3 youtube channels above 500k subscribers"
+SELECT channel_name, channel_handle, profile_link, niche, subscribers, avg_long_views, long_engagement_rate FROM youtube_creators WHERE subscribers IS NOT NULL AND subscribers > 500000 ORDER BY subscribers DESC LIMIT 3
+
+User: "Platform: youtube. show me youtube shorts engagement rates"
 SELECT channel_name, channel_handle, subscribers, avg_short_views, short_engagement_rate FROM youtube_creators WHERE short_engagement_rate IS NOT NULL AND short_engagement_rate > 0 ORDER BY short_engagement_rate DESC
 
-User: "linkedin profiles in tech"
+User: "Platform: linkedin. linkedin profiles in tech"
 SELECT full_name, profile_id, profile_link, headline, current_company, industry, connections FROM linkedin_creators WHERE LOWER(industry) LIKE '%tech%' OR LOWER(headline) LIKE '%tech%'
 
-User: "who has the most followers"
+User: "Platform: linkedin. top 3 profiles with most connections"
+SELECT full_name, profile_id, profile_link, headline, current_company, connections FROM linkedin_creators WHERE connections IS NOT NULL AND connections > 0 ORDER BY connections DESC LIMIT 3
+
+User: "Platform: instagram. who has the most followers"
 SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE followers IS NOT NULL AND followers > 0 ORDER BY followers DESC LIMIT 1
 
-User: "beauty creators in mumbai"
+User: "Platform: instagram. beauty creators in mumbai"
 SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE LOWER(niche) LIKE LOWER('%beauty%') AND LOWER(location) LIKE LOWER('%mumbai%')
 
-User: "creators whose niche is blank"
+User: "Platform: instagram. creators whose niche is blank"
 SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE niche IS NULL OR TRIM(niche) = ''
 
-User: "top 5 youtube channels by engagement"
-SELECT channel_name, channel_handle, subscribers, avg_long_views, long_engagement_rate FROM youtube_creators WHERE long_engagement_rate IS NOT NULL AND long_engagement_rate > 0 ORDER BY long_engagement_rate DESC LIMIT 5
-
-User: "count of creators by niche"
+User: "Platform: instagram. count of creators by niche"
 SELECT niche, COUNT(*) as count FROM influencers WHERE niche IS NOT NULL AND TRIM(niche) != '' GROUP BY niche ORDER BY count DESC
 
-User: "show me all youtube data"
-SELECT * FROM youtube_creators
-
-User: "linkedin creators at google"
+User: "Platform: linkedin. linkedin creators at google"
 SELECT full_name, profile_id, profile_link, headline, current_company, connections FROM linkedin_creators WHERE LOWER(current_company) LIKE '%google%'"""
 
 
-# ─── INSIGHT PROMPT ─────────────────────────────────────────────────
+# ─── Table metadata (used for building schema + deterministic insight) ──
 
-INSIGHT_SYSTEM = """You are a helpful data analyst for an influencer talent agency. The user asked a question and we queried the database. Your job is to DIRECTLY ANSWER their question based on the results.
-
-Rules:
-- Be specific and actionable. Name specific creators, numbers, and fields.
-- Use <strong> for emphasis on key names and numbers.
-- No code blocks, no markdown — just plain text with HTML bold tags.
-- Keep it concise (2-5 sentences).
-- If the data shows blank/null/empty fields, LIST them specifically (e.g. "Missing fields for @creator: niche, location, email").
-- If 0 results, say so clearly and suggest what the user might try instead.
-- NEVER say "the query returned no results" if data IS present. Analyze the actual data."""
+_PLATFORM_TO_SCHEMA = {
+    'instagram': SCHEMA_IG,
+    'youtube': SCHEMA_YT,
+    'linkedin': SCHEMA_LI,
+}
 
 
-async def execute_mcp_query(user_query: str, skip_insight: bool = False) -> dict:
+def _ensure_platform_db(platform: str) -> sqlite3.Connection:
+    """Return a persistent sqlite connection for the given platform.
+
+    Loads the table from Supabase the first time, and refreshes in-place
+    every ``CACHE_TTL`` seconds using INSERT/DELETE (no pandas, no schema
+    rebuilds). Thread-safe.
+    """
+    schema = _PLATFORM_TO_SCHEMA[platform]
+    table = schema['table']
+    cols = schema['columns']
+    col_names = list(cols.keys())
+
+    with _DB_LOCK:
+        conn = _DB_CONNS.get(platform)
+        if conn is None:
+            conn = sqlite3.connect(':memory:', check_same_thread=False)
+            col_defs = ', '.join(f'"{c}" {t}' for c, t in cols.items())
+            conn.execute(f'CREATE TABLE IF NOT EXISTS {table} ({col_defs})')
+            _DB_CONNS[platform] = conn
+            _DB_LAST_REFRESH[platform] = 0
+
+        now = time.time()
+        last = _DB_LAST_REFRESH.get(platform, 0)
+        if (now - last) <= CACHE_TTL:
+            return conn
+
+        try:
+            resp = supabase.table(table).select('*').execute()
+            records = resp.data or []
+        except Exception as fetch_err:
+            logger.error(f"[MCP] Supabase fetch failed for {table}: {fetch_err}")
+            # Keep serving the stale cache if we already have data
+            _DB_LAST_REFRESH[platform] = now - (CACHE_TTL // 2)
+            return conn
+
+        placeholders = ','.join('?' for _ in col_names)
+        col_list = ','.join(f'"{c}"' for c in col_names)
+        rows = [tuple(rec.get(c) for c in col_names) for rec in records]
+
+        try:
+            conn.execute('BEGIN')
+            conn.execute(f'DELETE FROM {table}')
+            if rows:
+                conn.executemany(
+                    f'INSERT INTO {table} ({col_list}) VALUES ({placeholders})',
+                    rows,
+                )
+            conn.commit()
+            _DB_LAST_REFRESH[platform] = now
+        except Exception as load_err:
+            conn.rollback()
+            logger.error(f"[MCP] Failed to refresh {table}: {load_err}")
+
+        return conn
+
+
+def _normalize_query(q: str) -> str:
+    return ' '.join((q or '').lower().split())
+
+
+def _result_cache_get(platform: str, user_query: str):
+    key = (platform, _normalize_query(user_query))
+    with _RESULT_CACHE_LOCK:
+        item = _RESULT_CACHE.get(key)
+        if not item:
+            return None
+        expiry, value = item
+        if time.time() > expiry:
+            _RESULT_CACHE.pop(key, None)
+            return None
+        _RESULT_CACHE.move_to_end(key)
+        return value
+
+
+def _result_cache_put(platform: str, user_query: str, value: dict):
+    key = (platform, _normalize_query(user_query))
+    with _RESULT_CACHE_LOCK:
+        _RESULT_CACHE[key] = (time.time() + RESULT_CACHE_TTL, value)
+        _RESULT_CACHE.move_to_end(key)
+        while len(_RESULT_CACHE) > _RESULT_CACHE_MAX:
+            _RESULT_CACHE.popitem(last=False)
+
+
+def _build_insight(platform: str, rows: list, sql: str) -> str:
+    """Deterministic short summary — replaces the old LLM insight call."""
+    n = len(rows)
+    if n == 0:
+        return "No results matched your query. Try loosening the filters (e.g. a lower follower threshold)."
+
+    sql_upper = (sql or '').upper()
+    is_aggregate = any(fn in sql_upper for fn in ('COUNT(', 'SUM(', 'AVG(', 'MIN(', 'MAX('))
+
+    if is_aggregate and n == 1:
+        vals = ', '.join(f"{k}: {v}" for k, v in rows[0].items() if v not in (None, ''))
+        return f"Result: {vals}" if vals else f"Found {n} result(s)."
+
+    if n == 1:
+        row = rows[0]
+        if platform == 'youtube':
+            name = row.get('channel_name') or row.get('channel_handle') or 'Unknown'
+            subs = row.get('subscribers')
+            niche = row.get('niche')
+            bits = [f"*{name}*"]
+            if subs:
+                bits.append(f"{subs:,} subscribers" if isinstance(subs, (int, float)) else str(subs))
+            if niche:
+                bits.append(str(niche))
+            return "Found 1 result: " + " · ".join(bits)
+        if platform == 'linkedin':
+            name = row.get('full_name') or row.get('profile_id') or 'Unknown'
+            headline = row.get('headline')
+            conns = row.get('connections')
+            bits = [f"*{name}*"]
+            if headline:
+                bits.append(str(headline))
+            if conns:
+                bits.append(f"{conns:,} connections" if isinstance(conns, (int, float)) else str(conns))
+            return "Found 1 result: " + " · ".join(bits)
+        name = row.get('creator_name') or row.get('username') or 'Unknown'
+        followers = row.get('followers')
+        niche = row.get('niche')
+        bits = [f"*{name}*"]
+        if followers:
+            bits.append(f"{followers:,} followers" if isinstance(followers, (int, float)) else str(followers))
+        if niche:
+            bits.append(str(niche))
+        return "Found 1 result: " + " · ".join(bits)
+
+    label = {'instagram': 'Instagram creators',
+             'youtube': 'YouTube channels',
+             'linkedin': 'LinkedIn profiles'}.get(platform, 'results')
+    return f"Found {n} {label}."
+
+
+async def execute_mcp_query(user_query: str, skip_insight: bool = False, platform: str = None) -> dict:
     """Direct SQL approach: LLM writes SQL, we validate & execute safely.
-    
+
     Now supports all three tables: influencers, youtube_creators, linkedin_creators.
+
+    Platform resolution:
+      1. If `platform` arg is provided explicitly (e.g. after the bot asked the user),
+         use it directly.
+      2. Otherwise we detect from the user's text via `detect_platform`.
+      3. If still ambiguous, return a `{'type': 'clarify'}` response so the caller
+         can ask the user which platform they meant.
     """
     try:
-        # 1. Fetch data from all tables (with 60s cache)
-        now = time.time()
-        if _cache["ig"] is None or (now - _cache["timestamp"]) > CACHE_TTL:
-            ig_resp = supabase.table("influencers").select("*").execute()
-            yt_resp = supabase.table("youtube_creators").select("*").execute()
-            li_resp = supabase.table("linkedin_creators").select("*").execute()
-            _cache["ig"] = ig_resp.data or []
-            _cache["yt"] = yt_resp.data or []
-            _cache["li"] = li_resp.data or []
-            _cache["timestamp"] = now
-
-        ig_records = _cache["ig"]
-        yt_records = _cache["yt"]
-        li_records = _cache["li"]
-
-        total = len(ig_records) + len(yt_records) + len(li_records)
-        if total == 0:
-            return {"type": "data", "data": [], "insight": "The database is currently empty across all platforms."}
-
-        # Load all tables into in-memory SQLite
-        conn = sqlite3.connect(':memory:')
-        if ig_records:
-            pd.DataFrame(ig_records).to_sql('influencers', conn, index=False)
+        # ── Resolve platform ──
+        resolved_platform = None
+        if platform and platform.strip().lower() in ('instagram', 'youtube', 'linkedin'):
+            resolved_platform = platform.strip().lower()
         else:
-            # Create empty table so queries don't fail
-            pd.DataFrame(columns=list(SCHEMA_IG["columns"].keys())).to_sql('influencers', conn, index=False)
+            resolved_platform = detect_platform(user_query)
 
-        if yt_records:
-            pd.DataFrame(yt_records).to_sql('youtube_creators', conn, index=False)
-        else:
-            pd.DataFrame(columns=list(SCHEMA_YT["columns"].keys())).to_sql('youtube_creators', conn, index=False)
+        if not resolved_platform:
+            return {
+                'type': 'clarify',
+                'message': "Which platform did you mean — Instagram, YouTube, or LinkedIn?",
+                'reason': 'platform_ambiguous',
+            }
 
-        if li_records:
-            pd.DataFrame(li_records).to_sql('linkedin_creators', conn, index=False)
-        else:
-            pd.DataFrame(columns=list(SCHEMA_LI["columns"].keys())).to_sql('linkedin_creators', conn, index=False)
+        # ── Result cache: identical question within RESULT_CACHE_TTL ──
+        cached = _result_cache_get(resolved_platform, user_query)
+        if cached is not None:
+            return cached
 
-        # 2. Ask LLM to write SQL directly
+        # ── Ensure persistent SQLite DB for this platform only ──
+        conn = _ensure_platform_db(resolved_platform)
+
+        # Quick empty check
+        schema = _PLATFORM_TO_SCHEMA[resolved_platform]
+        cnt_row = conn.execute(f"SELECT COUNT(*) FROM {schema['table']}").fetchone()
+        if not cnt_row or cnt_row[0] == 0:
+            result = {
+                "type": "data",
+                "platform": resolved_platform,
+                "data": [],
+                "insight": f"No {resolved_platform} creators in the database yet.",
+            }
+            return result
+
+        # ── Ask LLM to write SQL (only one LLM call per query now) ──
         client_llm = OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=NVIDIA_KEY)
+        hinted_query = f"Platform: {resolved_platform}. {user_query}"
 
         llm_response = client_llm.chat.completions.create(
             model="meta/llama-3.1-8b-instruct",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_query}
+                {"role": "user", "content": hinted_query},
             ],
             temperature=0.0,
-            max_tokens=512
+            max_tokens=256,
         )
 
         raw_sql = llm_response.choices[0].message.content.strip()
-
-        # Clean markdown code fences if the LLM wraps the output
         raw_sql = raw_sql.replace('```sql', '').replace('```', '').strip()
-        # Remove any leading explanation text (take last SQL-looking line block)
         lines = raw_sql.split('\n')
         sql_lines = [l for l in lines if l.strip() and not l.strip().startswith('--') and not l.strip().startswith('#')]
         if sql_lines:
             raw_sql = ' '.join(sql_lines)
 
-        logger.info(f"[MCP] LLM generated SQL: {raw_sql}")
+        raw_sql = _patch_sql_with_user_limit(raw_sql, user_query)
+        logger.info(f"[MCP] Platform: {resolved_platform} | LLM SQL: {raw_sql}")
 
-        # 3. Validate SQL for safety
         is_safe, error_msg, cleaned_sql = validate_sql(raw_sql)
         if not is_safe:
             logger.warning(f"[MCP] SQL blocked: {error_msg} | Raw: {raw_sql}")
-            return {
-                "type": "error",
-                "message": f"Query safety check failed: {error_msg}"
-            }
+            return {"type": "error", "message": f"Query safety check failed: {error_msg}"}
 
         logger.info(f"[MCP] Executing SQL: {cleaned_sql}")
 
-        # 4. Execute the validated SQL
+        # ── Execute using the stdlib cursor (no pandas) ──
+        def _run_sql(sql: str):
+            cur = conn.execute(sql)
+            col_names = [d[0] for d in (cur.description or [])]
+            rows = cur.fetchall()
+            return col_names, rows
+
         try:
-            result_df = pd.read_sql_query(cleaned_sql, conn)
+            col_names, rows = _run_sql(cleaned_sql)
         except sqlite3.Error as sql_err:
             logger.error(f"[MCP] SQL execution error: {sql_err} | SQL: {cleaned_sql}")
-            # Fallback: try a simple SELECT * query on the most likely table
             try:
-                # Detect which table was intended
-                sql_upper = cleaned_sql.upper()
-                if 'YOUTUBE_CREATORS' in sql_upper:
-                    fallback_sql = "SELECT * FROM youtube_creators LIMIT 50"
-                elif 'LINKEDIN_CREATORS' in sql_upper:
-                    fallback_sql = "SELECT * FROM linkedin_creators LIMIT 50"
-                else:
-                    fallback_sql = "SELECT * FROM influencers LIMIT 50"
-                result_df = pd.read_sql_query(fallback_sql, conn)
+                fallback_sql = f"SELECT * FROM {schema['table']} LIMIT 50"
+                col_names, rows = _run_sql(fallback_sql)
                 cleaned_sql = fallback_sql
                 logger.info(f"[MCP] Fell back to: {fallback_sql}")
-            except:
+            except Exception:
                 return {"type": "error", "message": f"Query error: {sql_err}", "sql": cleaned_sql}
 
-        # 5. Generate insight — smart answer to the user's question
-        insight_text = f"Found {len(result_df)} result(s)."
-        '''
-        try:
-            sample_size = min(30, len(result_df))
-            sample_data = result_df.head(sample_size).to_json(orient='records')
+        data_rows = [
+            {col: ('' if val is None else val) for col, val in zip(col_names, r)}
+            for r in rows
+        ]
 
-            insight_prompt = [
-                {"role": "system", "content": INSIGHT_SYSTEM},
-                {"role": "user", "content": f"User's question: \"{user_query}\"\n\nSQL used: {cleaned_sql}\n\nQuery returned {len(result_df)} rows. Data:\n{sample_data}"}
-            ]
+        insight_text = ''
+        if not skip_insight:
+            insight_text = _build_insight(resolved_platform, data_rows, cleaned_sql)
 
-            insight_response = client_llm.chat.completions.create(
-                model="meta/llama-3.1-8b-instruct",
-                messages=insight_prompt,
-                temperature=0.3,
-                max_tokens=500
-            )
-            insight_text = insight_response.choices[0].message.content.strip()
-        except Exception as insight_err:
-            logger.error(f"[MCP] Insight generation error: {insight_err}")
-            insight_text = f"Found {len(result_df)} result(s)."
-        '''
-
-        return {
+        result = {
             "type": "data",
+            "platform": resolved_platform,
             "sql": cleaned_sql,
-            "data": result_df.fillna('').to_dict(orient="records"),
-            "insight": insight_text
+            "data": data_rows,
+            "insight": insight_text,
         }
+
+        _result_cache_put(resolved_platform, user_query, result)
+        return result
 
     except Exception as e:
         import traceback

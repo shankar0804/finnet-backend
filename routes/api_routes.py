@@ -11,11 +11,45 @@ import jwt
 import bcrypt
 import os
 import uuid
+import threading
+import time as _time
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
 api_bp = Blueprint('api_routes', __name__)
 logger = logging.getLogger(__name__)
+
+# ─── Concurrency limits ──────────────────────────────────────────
+# Keeps the Render instance from being overwhelmed when many users
+# request slow Apify scrapes or bulk imports simultaneously. Values
+# are env-tunable so you can bump them on a bigger plan.
+SCRAPE_MAX = max(1, int(os.environ.get('SCRAPE_MAX', '3')))
+BULK_MAX = max(1, int(os.environ.get('BULK_MAX', '1')))
+SCRAPE_WAIT_MAX_SECONDS = int(os.environ.get('SCRAPE_WAIT_MAX_SECONDS', '120'))
+
+SCRAPE_SEMAPHORE = threading.BoundedSemaphore(SCRAPE_MAX)
+BULK_SEMAPHORE = threading.BoundedSemaphore(BULK_MAX)
+
+
+def _acquire_scrape_slot(timeout: float = None) -> bool:
+    """Try to grab a scraper slot. Returns True if acquired, False on timeout."""
+    if timeout is None:
+        timeout = SCRAPE_WAIT_MAX_SECONDS
+    return SCRAPE_SEMAPHORE.acquire(timeout=timeout)
+
+
+def _release_scrape_slot():
+    try:
+        SCRAPE_SEMAPHORE.release()
+    except ValueError:
+        # Releasing more times than acquired — safe to ignore.
+        pass
+
+
+logger.info(
+    f"[CONCURRENCY] SCRAPE_MAX={SCRAPE_MAX} BULK_MAX={BULK_MAX} "
+    f"SCRAPE_WAIT_MAX_SECONDS={SCRAPE_WAIT_MAX_SECONDS}"
+)
 
 # ─── JWT Configuration ───
 JWT_SECRET = os.environ.get('JWT_SECRET', os.environ.get('FLASK_SECRET_KEY', 'trakrx-default-secret-change-me'))
@@ -94,18 +128,98 @@ def audit_log(operation, target_table, target_id='', details=None, source='dashb
     except Exception as e:
         logger.warning(f'[AUDIT] Failed to write audit log: {e}')
 
+# ═══════════════════════════════════════════════════════════
+# Validation helpers (niche / language / gender)
+# ═══════════════════════════════════════════════════════════
+import time as _time
+
+ALLOWED_GENDERS = {'Male', 'Female', 'Other'}
+
+_allowed_cache = {'ts': 0.0, 'niche': set(), 'language': set(), 'raw': {'niche': [], 'language': []}}
+_ALLOWED_CACHE_TTL = 30  # seconds — short TTL so admin edits propagate quickly
+
+def _refresh_allowed_cache(force=False):
+    now = _time.time()
+    if not force and (now - _allowed_cache['ts'] < _ALLOWED_CACHE_TTL) and _allowed_cache['raw']['niche']:
+        return
+    try:
+        resp = supabase.table('allowed_values').select('category,value').execute()
+        raw = {'niche': [], 'language': []}
+        sets = {'niche': set(), 'language': set()}
+        for row in (resp.data or []):
+            cat = row.get('category')
+            val = (row.get('value') or '').strip()
+            if cat in raw and val:
+                raw[cat].append(val)
+                sets[cat].add(val.lower())
+        _allowed_cache['raw'] = raw
+        _allowed_cache['niche'] = sets['niche']
+        _allowed_cache['language'] = sets['language']
+        _allowed_cache['ts'] = now
+    except Exception as e:
+        logger.warning(f'[VALIDATION] Failed to refresh allowed-values cache: {e}')
+
+def _canonical_value(category, value):
+    """Return the canonically-cased value from the DB, or None if not allowed.
+    For niche, a comma-separated value is split and each part is validated.
+    """
+    _refresh_allowed_cache()
+    if category == 'gender':
+        v = (value or '').strip()
+        if not v:
+            return None
+        for g in ALLOWED_GENDERS:
+            if v.lower() == g.lower():
+                return g
+        return None
+    if category not in ('niche', 'language'):
+        return value  # no validation for other fields
+    raw_list = _allowed_cache['raw'].get(category, [])
+    lookup = {v.lower(): v for v in raw_list}
+    if category == 'niche':
+        parts = [p.strip() for p in (value or '').split(',') if p.strip()]
+        if not parts:
+            return None
+        canonical = []
+        for p in parts:
+            canon = lookup.get(p.lower())
+            if not canon:
+                return None
+            canonical.append(canon)
+        return ', '.join(canonical)
+    # language
+    return lookup.get((value or '').strip().lower())
+
+def _allowed_list(category):
+    _refresh_allowed_cache()
+    if category == 'gender':
+        return sorted(ALLOWED_GENDERS)
+    return sorted(_allowed_cache['raw'].get(category, []))
+
+# ═══════════════════════════════════════════════════════════
+# Bulk-import cancellation registry (in-process)
+# ═══════════════════════════════════════════════════════════
+# Maps job_id -> {'status': 'running'|'cancelled'|'completed', 'started_at': ts}
+# Background workers check is_cancelled() between rows and abort gracefully.
+BULK_JOBS = {}
+
+def _is_bulk_cancelled(job_id):
+    return BULK_JOBS.get(job_id, {}).get('status') == 'cancelled'
+
 @api_bp.route('/custom-search', methods=['POST'])
 def custom_search():
     try:
         data = request.get_json(silent=True) or {}
         query = data.get('query', '')
         skip_insight = data.get('skip_insight', False)
-        if not query: return jsonify({"error": "Empty Query"}), 400
-        
+        platform = data.get('platform')  # optional: 'instagram' | 'youtube' | 'linkedin'
+        if not query:
+            return jsonify({"error": "Empty Query"}), 400
+
         import asyncio
         from services.mcp_service import execute_mcp_query
-        
-        answer = asyncio.run(execute_mcp_query(query, skip_insight=skip_insight))
+
+        answer = asyncio.run(execute_mcp_query(query, skip_insight=skip_insight, platform=platform))
         return jsonify({"answer": answer})
     except Exception as e:
         logger.error(f"API /custom-search Error: {e}")
@@ -127,20 +241,23 @@ def scrape_instagram():
     username = username.split('?')[0].split('/')[0].strip()
     if not username: return jsonify({"error": "Username is required"}), 400
 
+    if not _acquire_scrape_slot():
+        logger.warning(f"[SCRAPE] Rejected @{username} — all {SCRAPE_MAX} scraper slots busy")
+        return jsonify({
+            "error": "Scraper busy",
+            "details": f"All {SCRAPE_MAX} scraper slots are currently busy. Please try again in a moment.",
+        }), 503
+
     try:
-        # Layer 1: Run Business Logic Scraper
         influencer_model = fetch_influencer_data(username)
-        
-        # Layer 2: Save to SQL Database (Supabase)
-        # We do an UPSERT in case the influencer already exists
+
         resp = supabase.table("influencers").upsert(influencer_model, on_conflict="username").execute()
-        
+
         audit_log('UPSERT', 'influencers', username, {
             'creator_name': influencer_model.get('creator_name'),
             'followers': influencer_model.get('followers'),
         }, source='dashboard')
 
-        # Return success
         return jsonify({
             "creatorName": influencer_model["creator_name"],
             "username": influencer_model["username"],
@@ -148,7 +265,6 @@ def scrape_instagram():
             "message": "Successfully appended to Roster Database!"
         })
     except InsufficientDataError as e:
-        # Not enough reel data — do NOT save zeros to DB, inform the user
         logger.warning(f"API /scrape-instagram Insufficient data for @{username}: {e}")
         return jsonify({
             "error": "Insufficient Data",
@@ -158,6 +274,8 @@ def scrape_instagram():
     except Exception as e:
         logger.error(f"API /scrape-instagram Error: {e}")
         return jsonify({"error": "Scraping/DB Error", "details": str(e)}), 500
+    finally:
+        _release_scrape_slot()
 
 @api_bp.route('/upload', methods=['POST'])
 def upload_file():
@@ -599,25 +717,63 @@ def export_to_sheet():
         logger.error(f"API /export-to-sheet Error: {traceback.format_exc()}")
         return jsonify({"error": "Export failed", "details": str(e)}), 500
 
+# ─── Platform metadata for multi-platform updates ────────────
+# Each platform entry: table name, lookup-key column, human-friendly not-found label.
+PLATFORM_META = {
+    'instagram': {
+        'table': 'influencers',
+        'key': 'username',
+        'label': '@{id}',
+    },
+    'youtube': {
+        'table': 'youtube_creators',
+        'key': 'channel_handle',
+        'label': 'YouTube @{id}',
+    },
+    'linkedin': {
+        'table': 'linkedin_creators',
+        'key': 'profile_id',
+        'label': 'LinkedIn {id}',
+    },
+}
+
+
+def _platform_meta(platform: str):
+    """Resolve a platform string to its metadata, defaulting to Instagram."""
+    p = (platform or 'instagram').strip().lower()
+    # Accept a few aliases that the bot / LLM may emit
+    if p in ('ig', 'insta', 'instagram'):
+        p = 'instagram'
+    elif p in ('yt', 'youtube'):
+        p = 'youtube'
+    elif p in ('li', 'linkedin'):
+        p = 'linkedin'
+    return p, PLATFORM_META.get(p, PLATFORM_META['instagram'])
+
+
 @api_bp.route('/update-field', methods=['POST'])
 def update_field():
     """Allows updating manual/editable database columns for a creator from the LLM agent.
     Only manual fields can be updated via this endpoint. Auto-scraped fields (followers, avg_views etc.) are read-only.
-    An Instagram username (link) is ALWAYS required.
+    A creator identifier (link or handle) is ALWAYS required.
+    Body: { username, field, value, platform? }  (platform defaults to 'instagram')
     """
     try:
         data = request.get_json(silent=True) or {}
         username = data.get('username')
         field = data.get('field')
         value = data.get('value')
+        platform_in = data.get('platform') or 'instagram'
+        platform, meta = _platform_meta(platform_in)
+        table = meta['table']
+        key_col = meta['key']
 
         if not username:
-            return jsonify({"error": "An Instagram link or username is required to update a field. Please provide the creator's profile link."}), 400
+            return jsonify({"error": "A creator link or handle is required to update a field."}), 400
 
         if not field:
             return jsonify({"error": "Missing field name to update."}), 400
 
-        # Only these manual fields are allowed to be updated via the bot
         MANUAL_FIELDS = {
             'managed_by', 'niche', 'language', 'gender', 'location',
             'mail_id', 'contact_numbers', 'last_manual_at'
@@ -628,73 +784,438 @@ def update_field():
                 "error": f"The field '{field}' cannot be updated manually. Only these fields can be edited: {', '.join(sorted(MANUAL_FIELDS))}"
             }), 400
 
-        # Execute update
+        if field in ('niche', 'language', 'gender'):
+            canonical = _canonical_value(field, value)
+            if not canonical:
+                return jsonify({
+                    'error': f"'{value}' is not a valid {field}.",
+                    'field': field,
+                    'invalid_value': value,
+                    'allowed': _allowed_list(field),
+                }), 400
+            value = canonical
+
         from datetime import datetime, timezone
 
-        # Special handling for niche: APPEND instead of replace
         final_value = value
         if field == 'niche' and value:
-            # Fetch existing niche
-            existing = supabase.table("influencers").select("niche").eq("username", username).execute()
+            existing = supabase.table(table).select("niche").eq(key_col, username).execute()
             if existing.data and existing.data[0].get("niche"):
                 current_niches = [n.strip() for n in existing.data[0]["niche"].split(",") if n.strip()]
-                new_niche = value.strip()
-                # Only append if not already present (case-insensitive)
-                if new_niche.lower() not in [n.lower() for n in current_niches]:
-                    current_niches.append(new_niche)
-                    final_value = ", ".join(current_niches)
-                else:
-                    final_value = existing.data[0]["niche"]  # Already has it
+                new_niches = [n.strip() for n in value.split(',') if n.strip()]
+                for new_niche in new_niches:
+                    if new_niche.lower() not in [n.lower() for n in current_niches]:
+                        current_niches.append(new_niche)
+                final_value = ", ".join(current_niches)
 
         update_data = {
             field: final_value,
             "last_manual_at": datetime.now(timezone.utc).isoformat()
         }
-        response = supabase.table("influencers").update(update_data).eq("username", username).execute()
+        response = supabase.table(table).update(update_data).eq(key_col, username).execute()
 
         if len(response.data) == 0:
-             return jsonify({"error": f"Creator @{username} not found in database. Make sure the profile is scraped first."}), 404
+            label = meta['label'].format(id=username)
+            return jsonify({"error": f"Creator {label} not found in database. Make sure the profile is scraped first."}), 404
 
-        audit_log('UPDATE', 'influencers', username, {
+        audit_log('UPDATE', table, username, {
             'field': field,
             'new_value': str(final_value)[:200]
         }, source='whatsapp_bot')
 
+        label = meta['label'].format(id=username)
         return jsonify({
             "success": True,
-            "message": f"Updated `{field}` to `{final_value}` for @{username}",
+            "platform": platform,
+            "message": f"Updated `{field}` to `{final_value}` for {label}",
             "data": response.data[0]
         })
     except Exception as e:
         logger.error(f"API /update-field Error: {traceback.format_exc()}")
         return jsonify({"error": "Update failed", "details": str(e)}), 500
 
+
+# ═══════════════════════════════════════════════════════════
+# Bulk field update (multi-field in one request)
+# ═══════════════════════════════════════════════════════════
+@api_bp.route('/update-fields', methods=['POST'])
+def update_fields_bulk():
+    """Apply multiple field updates to a single creator atomically-per-field.
+    Body: { username, updates: [ { field, value }, ... ], platform? }  (platform defaults to 'instagram')
+    Returns per-field results: { success, applied: [...], rejected: [...] }
+    Each rejected entry includes the allowed list so the bot can re-prompt.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        username = (data.get('username') or '').strip().lstrip('@')
+        updates = data.get('updates') or []
+        platform_in = data.get('platform') or 'instagram'
+        platform, meta = _platform_meta(platform_in)
+        table = meta['table']
+        key_col = meta['key']
+
+        if not username:
+            return jsonify({'error': 'username is required'}), 400
+        if not isinstance(updates, list) or not updates:
+            return jsonify({'error': 'updates must be a non-empty list'}), 400
+
+        MANUAL_FIELDS = {
+            'managed_by', 'niche', 'language', 'gender', 'location',
+            'mail_id', 'contact_numbers'
+        }
+
+        existing_resp = supabase.table(table).select('*').eq(key_col, username).execute()
+        if not existing_resp.data:
+            label = meta['label'].format(id=username)
+            return jsonify({'error': f'Creator {label} not found. Scrape first.'}), 404
+        existing_row = existing_resp.data[0]
+
+        applied = []
+        rejected = []
+        db_patch = {}
+
+        from datetime import datetime, timezone
+
+        for upd in updates:
+            field = (upd.get('field') or '').strip()
+            value = upd.get('value')
+            if field not in MANUAL_FIELDS:
+                rejected.append({'field': field, 'value': value, 'reason': 'field not editable'})
+                continue
+            if value is None or str(value).strip() == '':
+                rejected.append({'field': field, 'value': value, 'reason': 'empty value'})
+                continue
+
+            # Controlled-vocab validation
+            if field in ('niche', 'language', 'gender'):
+                canon = _canonical_value(field, str(value))
+                if not canon:
+                    rejected.append({
+                        'field': field,
+                        'value': value,
+                        'reason': f"'{value}' is not a valid {field}",
+                        'allowed': _allowed_list(field),
+                    })
+                    continue
+                value = canon
+
+            # Niche append-semantics against existing + already-patched niche
+            if field == 'niche':
+                current_source = db_patch.get('niche', existing_row.get('niche') or '')
+                current_list = [n.strip() for n in current_source.split(',') if n.strip()]
+                for new_n in [n.strip() for n in str(value).split(',') if n.strip()]:
+                    if new_n.lower() not in [n.lower() for n in current_list]:
+                        current_list.append(new_n)
+                value = ', '.join(current_list)
+
+            db_patch[field] = value
+            applied.append({'field': field, 'value': value})
+
+        if not db_patch:
+            return jsonify({
+                'success': False,
+                'applied': [],
+                'rejected': rejected,
+                'message': 'No valid updates to apply.',
+            }), 400
+
+        db_patch['last_manual_at'] = datetime.now(timezone.utc).isoformat()
+
+        resp = supabase.table(table).update(db_patch).eq(key_col, username).execute()
+
+        for a in applied:
+            audit_log('UPDATE', table, username, {
+                'field': a['field'], 'new_value': str(a['value'])[:200]
+            }, source='whatsapp_bot')
+
+        return jsonify({
+            'success': True,
+            'platform': platform,
+            'username': username,
+            'applied': applied,
+            'rejected': rejected,
+            'data': (resp.data or [None])[0],
+        })
+    except Exception as e:
+        logger.error(f'API /update-fields Error: {traceback.format_exc()}')
+        return jsonify({'error': 'Bulk update failed', 'details': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+# Allowed values (niche + language taxonomy) — admin-managed
+# ═══════════════════════════════════════════════════════════
+@api_bp.route('/allowed-values', methods=['GET'])
+def list_allowed_values():
+    """List allowed niche + language values. Publicly readable (any auth user).
+    Query: ?category=niche|language (optional — defaults to all)
+    """
+    try:
+        _refresh_allowed_cache(force=True)
+        cat = request.args.get('category')
+        if cat == 'gender':
+            return jsonify({'category': 'gender', 'values': sorted(ALLOWED_GENDERS)})
+        if cat in ('niche', 'language'):
+            resp = supabase.table('allowed_values').select('id,category,value,created_at,created_by').eq('category', cat).order('value').execute()
+            return jsonify({'category': cat, 'values': resp.data or []})
+        # all
+        resp = supabase.table('allowed_values').select('id,category,value,created_at,created_by').order('category').order('value').execute()
+        grouped = {'niche': [], 'language': []}
+        for r in (resp.data or []):
+            grouped.setdefault(r['category'], []).append(r)
+        grouped['gender'] = [{'value': g} for g in sorted(ALLOWED_GENDERS)]
+        return jsonify(grouped)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/allowed-values', methods=['POST'])
+@require_admin
+def add_allowed_value(current_user=None):
+    """Admin-only: add a new niche or language."""
+    try:
+        data = request.get_json(silent=True) or {}
+        category = (data.get('category') or '').strip().lower()
+        value = (data.get('value') or '').strip()
+        if category not in ('niche', 'language'):
+            return jsonify({'error': "category must be 'niche' or 'language'"}), 400
+        if not value:
+            return jsonify({'error': 'value is required'}), 400
+        if len(value) > 100:
+            return jsonify({'error': 'value too long (max 100 chars)'}), 400
+
+        # Duplicate check (case-insensitive)
+        _refresh_allowed_cache(force=True)
+        if value.lower() in _allowed_cache.get(category, set()):
+            return jsonify({'error': f"'{value}' already exists in {category}"}), 409
+
+        resp = supabase.table('allowed_values').insert({
+            'category': category,
+            'value': value,
+            'created_by': current_user.get('email', ''),
+        }).execute()
+        _refresh_allowed_cache(force=True)
+
+        audit_log('INSERT', 'allowed_values', value, {'category': category}, source='dashboard')
+        return jsonify({'success': True, 'data': (resp.data or [None])[0]})
+    except Exception as e:
+        logger.error(f'/allowed-values POST error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/allowed-values/<vid>', methods=['DELETE'])
+@require_admin
+def delete_allowed_value(vid, current_user=None):
+    """Admin-only: remove a niche or language."""
+    try:
+        # Fetch for audit
+        row = supabase.table('allowed_values').select('*').eq('id', vid).execute()
+        if not row.data:
+            return jsonify({'error': 'Not found'}), 404
+        target = row.data[0]
+        supabase.table('allowed_values').delete().eq('id', vid).execute()
+        _refresh_allowed_cache(force=True)
+        audit_log('DELETE', 'allowed_values', target.get('value', ''), {'category': target.get('category')}, source='dashboard')
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+# WhatsApp whitelist + settings
+# ═══════════════════════════════════════════════════════════
+def _normalize_phone(raw):
+    if not raw:
+        return ''
+    import re as _re
+    digits = _re.sub(r'\D', '', str(raw))
+    # Strip any leading 0 from country code-less input (conservative)
+    return digits
+
+
+@api_bp.route('/whatsapp/whitelist', methods=['GET'])
+def list_whitelist():
+    try:
+        resp = supabase.table('whatsapp_whitelist').select('*').order('created_at', desc=True).execute()
+        return jsonify(resp.data or [])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/whatsapp/whitelist', methods=['POST'])
+@require_admin
+def add_whitelist(current_user=None):
+    try:
+        data = request.get_json(silent=True) or {}
+        phone = _normalize_phone(data.get('phone_number'))
+        label = (data.get('label') or '').strip()
+        scope = (data.get('scope') or 'both').strip().lower()
+        if scope not in ('dm', 'group', 'both'):
+            scope = 'both'
+        if not phone or len(phone) < 8 or len(phone) > 20:
+            return jsonify({'error': 'Invalid phone_number. Use digits only, with country code (e.g. 919876543210).'}), 400
+
+        resp = supabase.table('whatsapp_whitelist').upsert({
+            'phone_number': phone,
+            'label': label,
+            'scope': scope,
+            'enabled': True,
+            'created_by': current_user.get('email', ''),
+        }, on_conflict='phone_number').execute()
+
+        audit_log('INSERT', 'whatsapp_whitelist', phone, {'label': label, 'scope': scope}, source='dashboard')
+        return jsonify({'success': True, 'data': (resp.data or [None])[0]})
+    except Exception as e:
+        logger.error(f'/whatsapp/whitelist POST error: {e}')
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/whatsapp/whitelist/<wid>', methods=['DELETE'])
+@require_admin
+def delete_whitelist(wid, current_user=None):
+    try:
+        row = supabase.table('whatsapp_whitelist').select('*').eq('id', wid).execute()
+        if not row.data:
+            return jsonify({'error': 'Not found'}), 404
+        target = row.data[0]
+        supabase.table('whatsapp_whitelist').delete().eq('id', wid).execute()
+        audit_log('DELETE', 'whatsapp_whitelist', target.get('phone_number', ''), {'label': target.get('label')}, source='dashboard')
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/whatsapp/whitelist/<wid>/toggle', methods=['POST'])
+@require_admin
+def toggle_whitelist_entry(wid, current_user=None):
+    try:
+        row = supabase.table('whatsapp_whitelist').select('*').eq('id', wid).execute()
+        if not row.data:
+            return jsonify({'error': 'Not found'}), 404
+        new_val = not bool(row.data[0].get('enabled'))
+        supabase.table('whatsapp_whitelist').update({'enabled': new_val}).eq('id', wid).execute()
+        return jsonify({'success': True, 'enabled': new_val})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/whatsapp/settings', methods=['GET'])
+def get_bot_settings():
+    try:
+        resp = supabase.table('bot_settings').select('*').execute()
+        settings = {}
+        for row in (resp.data or []):
+            settings[row['key']] = row.get('value', '')
+        # defaults
+        settings.setdefault('whitelist_enabled', 'false')
+        return jsonify(settings)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/whatsapp/settings', methods=['POST'])
+@require_admin
+def set_bot_settings(current_user=None):
+    """Admin-only: set bot setting keys. Body: { key, value }"""
+    try:
+        data = request.get_json(silent=True) or {}
+        key = (data.get('key') or '').strip()
+        value = data.get('value')
+        ALLOWED_KEYS = {'whitelist_enabled'}
+        if key not in ALLOWED_KEYS:
+            return jsonify({'error': f'key must be one of {sorted(ALLOWED_KEYS)}'}), 400
+        from datetime import datetime, timezone
+        supabase.table('bot_settings').upsert({
+            'key': key,
+            'value': str(value).lower() if isinstance(value, bool) else str(value),
+            'updated_by': current_user.get('email', ''),
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+        }, on_conflict='key').execute()
+        audit_log('UPDATE', 'bot_settings', key, {'value': str(value)}, source='dashboard')
+        return jsonify({'success': True, 'key': key, 'value': value})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+# Bulk import cancellation
+# ═══════════════════════════════════════════════════════════
+@api_bp.route('/bulk-import/<job_id>/cancel', methods=['POST'])
+def cancel_bulk_import(job_id):
+    """Cancel a running bulk-import job. The background worker will pick up the
+    cancelled flag between rows and exit gracefully. Called by the bot when a
+    user types 'quit' during an import.
+    """
+    job = BULK_JOBS.get(job_id)
+    if not job:
+        return jsonify({'status': 'unknown', 'message': f'No active job {job_id}'}), 404
+    if job.get('status') in ('completed', 'failed'):
+        return jsonify({'status': job['status'], 'message': 'Job already finished'}), 200
+    job['status'] = 'cancelled'
+    logger.info(f'[BULK] Job {job_id} marked as cancelled')
+    return jsonify({'status': 'cancelled', 'job_id': job_id})
+
+
 @api_bp.route('/bulk-import', methods=['POST'])
 def bulk_import():
     """Bulk import influencers from a Google Sheet URL.
     Runs in a background thread so other requests aren't blocked.
     Sends progress updates and final report to callback_url if provided.
+
+    Optional body parameter `apply_to_all`:
+        List of {field, value} OR dict {field: value}. When provided, these
+        fields are used as DEFAULTS for every imported row (sheet columns win).
+        Useful when the user sends the sheet link with extra metadata like
+        "managed by Finnet Media" in the same WhatsApp message.
     """
     try:
         data = request.get_json(silent=True) or {}
         sheet_url = data.get('sheet_url')
-        callback_url = data.get('callback_url')  # Bot's webhook to receive updates
+        callback_url = data.get('callback_url')
+        raw_apply = data.get('apply_to_all') or []
+
+        # Normalize + validate apply_to_all  (list of {field, value} OR dict)
+        defaults: dict = {}
+        if isinstance(raw_apply, dict):
+            raw_apply = [{'field': k, 'value': v} for k, v in raw_apply.items()]
+        if isinstance(raw_apply, list):
+            for item in raw_apply:
+                if not isinstance(item, dict):
+                    continue
+                field = (item.get('field') or '').strip()
+                value = item.get('value')
+                if not field or value is None or str(value).strip() == '':
+                    continue
+                # Validate controlled-vocab fields; reject invalid values upfront
+                if field in ('niche', 'language', 'gender'):
+                    canon = _canonical_value(field, str(value))
+                    if not canon:
+                        return jsonify({
+                            'error': f"apply_to_all: '{value}' is not a valid {field}.",
+                            'field': field,
+                            'invalid_value': value,
+                            'allowed': _allowed_list(field),
+                        }), 400
+                    value = canon
+                defaults[field] = str(value).strip()
 
         if not sheet_url:
             return jsonify({'error': 'Missing sheet_url parameter.'}), 400
 
-        import threading
         import uuid
         import requests as http_req
 
         job_id = str(uuid.uuid4())[:8]
+        BULK_JOBS[job_id] = {'status': 'queued', 'started_at': _time.time()}
 
         def run_import():
-            """Background worker — processes the sheet and sends updates."""
+            """Background worker — processes the sheet and sends updates.
+
+            Serialized by BULK_SEMAPHORE: only BULK_MAX bulk jobs run at once.
+            Any extras wait here (not rejecting clients, just queueing).
+            """
             from services.bulk_import_service import process_sheet
 
             def send_progress(msg):
-                """Send progress update to bot via callback."""
                 if callback_url:
                     try:
                         http_req.post(callback_url, json={
@@ -705,20 +1226,45 @@ def bulk_import():
                     except Exception:
                         pass
 
-            report = process_sheet(sheet_url=sheet_url, progress_callback=send_progress)
+            def is_cancelled():
+                return BULK_JOBS.get(job_id, {}).get('status') == 'cancelled'
 
-            # Send final report to bot
+            waited_at = _time.time()
+            with BULK_SEMAPHORE:
+                waited_for = _time.time() - waited_at
+                if is_cancelled():
+                    BULK_JOBS[job_id]['status'] = 'cancelled'
+                    return
+                BULK_JOBS[job_id]['status'] = 'running'
+                if waited_for > 2:
+                    send_progress(f"⏳ Your import was queued for {waited_for:.0f}s. Starting now...")
+                    logger.info(f"[BULK] Job {job_id} waited {waited_for:.1f}s for a slot")
+
+                report = process_sheet(
+                    sheet_url=sheet_url,
+                    progress_callback=send_progress,
+                    is_cancelled=is_cancelled,
+                    apply_to_all=defaults,
+                    scrape_acquire=_acquire_scrape_slot,
+                    scrape_release=_release_scrape_slot,
+                )
+
+            final_status = 'cancelled' if is_cancelled() else 'completed'
+            if report.get('error'):
+                final_status = 'failed'
+            BULK_JOBS[job_id]['status'] = final_status
+
             if callback_url:
                 try:
                     http_req.post(callback_url, json={
                         'job_id': job_id,
                         'type': 'complete',
-                        'report': report
+                        'report': report,
+                        'status': final_status,
                     }, timeout=10)
                 except Exception as e:
                     logger.error(f"[BULK] Failed to send report to callback: {e}")
 
-        # Start background thread and return immediately
         thread = threading.Thread(target=run_import, daemon=True)
         thread.start()
 
@@ -1198,6 +1744,13 @@ def scrape_youtube():
     if not channel_input:
         return jsonify({'error': 'Missing channel URL or handle'}), 400
 
+    if not _acquire_scrape_slot():
+        logger.warning(f"[SCRAPE] Rejected YouTube {channel_input} — all {SCRAPE_MAX} scraper slots busy")
+        return jsonify({
+            'error': 'Scraper busy',
+            'details': f'All {SCRAPE_MAX} scraper slots are currently busy. Please try again in a moment.',
+        }), 503
+
     try:
         yt_data = fetch_youtube_data(channel_input)
 
@@ -1226,6 +1779,8 @@ def scrape_youtube():
     except Exception as e:
         logger.error(f"API /scrape-youtube Error: {e}")
         return jsonify({'error': 'Scraping/DB Error', 'details': str(e)}), 500
+    finally:
+        _release_scrape_slot()
 
 
 @api_bp.route('/youtube-roster', methods=['GET'])
@@ -1268,6 +1823,13 @@ def scrape_linkedin():
     if not profile_input:
         return jsonify({'error': 'Missing LinkedIn profile URL or identifier'}), 400
 
+    if not _acquire_scrape_slot():
+        logger.warning(f"[SCRAPE] Rejected LinkedIn {profile_input} — all {SCRAPE_MAX} scraper slots busy")
+        return jsonify({
+            'error': 'Scraper busy',
+            'details': f'All {SCRAPE_MAX} scraper slots are currently busy. Please try again in a moment.',
+        }), 503
+
     try:
         li_data = fetch_linkedin_data(profile_input)
 
@@ -1289,6 +1851,8 @@ def scrape_linkedin():
     except Exception as e:
         logger.error(f"API /scrape-linkedin Error: {e}")
         return jsonify({'error': 'Scraping/DB Error', 'details': str(e)}), 500
+    finally:
+        _release_scrape_slot()
 
 
 @api_bp.route('/linkedin-roster', methods=['GET'])

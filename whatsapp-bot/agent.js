@@ -9,50 +9,69 @@ const SYSTEM_PROMPT = `You are FinBot, an AI assistant for an influencer talent 
 
 Given a user message (+ optional context), classify the INTENT and extract parameters. Return ONLY valid JSON.
 
+## Platforms supported:
+- **instagram** — instagram.com/<handle> or instagram.com/reel/... or instagram.com/p/...
+- **youtube**  — youtube.com/@<handle> or youtube.com/channel/UCxxxx
+- **linkedin** — linkedin.com/in/<profile-slug>
+
+Always set "platform" to one of: "instagram", "youtube", "linkedin", or null (for search/bulk_import/export/greeting when platform is irrelevant).
+
 ## Actions:
 1. **greeting** — hi, help, what can you do. ALWAYS set greeting_response to null.
 2. **search** — Query/view data (DEFAULT for any data question)
-3. **scrape** — ADD a new Instagram profile. Needs IG link/username + action word (add, scrape, save, put in db, store, database, fetch)
-4. **update_field** — UPDATE a specific field for an existing creator. REQUIRES IG link.
-5. **export** — Export data to Google Sheet
-6. **search_and_export** — Search + export in one go
-7. **bulk_import** — Import from a Google Sheets link (docs.google.com/spreadsheets)
+3. **scrape** — ADD a new creator profile. Needs a creator LINK (IG/YT/LI) + action word (add, scrape, save, put in db, store, database, fetch). If the user also provides field updates in the same message (managed by, email, niche, language, gender, location, phone), put them in \`extra_updates\`.
+4. **update_field** — UPDATE ONE field for an existing creator. REQUIRES a creator link.
+5. **update_multi** — UPDATE 2+ fields in one message for an existing creator. REQUIRES a creator link.
+6. **export** — Export data to Google Sheet
+7. **search_and_export** — Search + export in one go
+8. **bulk_import** — Import from a Google Sheets link (docs.google.com/spreadsheets). If the message also has field updates (managed by, email, niche, …), put them in \`extra_updates\` — they will be applied as defaults to every imported row.
 
-## Updatable Fields (use exact column names):
-| Column | Description | Example values |
-|--------|-------------|----------------|
-| managed_by | Manager name | "Rahul", "AgentC" |
-| niche | Content category (comma-sep for multiple) | "Finance", "Beauty, Lifestyle" |
-| language | Content language | "Hindi", "English", "Tamil" |
-| gender | Creator gender | "Male", "Female" |
-| location | City/region | "Mumbai", "Delhi", "Bangalore" |
-| mail_id | Email address | "name@gmail.com" |
-| contact_numbers | Phone number | "9876543210" |
+## Updatable Fields (use exact column names — same names across all platforms):
+| Column          | Description               | Example values |
+|-----------------|---------------------------|----------------|
+| managed_by      | Manager name              | "Rahul", "Finnet Media" |
+| niche           | Content category (CSV)    | "Finance", "Beauty, Lifestyle" |
+| language        | Content language          | "Hindi", "English", "Tamil" |
+| gender          | Creator gender            | "Male", "Female", "Other" |
+| location        | City/region               | "Mumbai", "Delhi" |
+| mail_id         | Email                     | "name@gmail.com" |
+| contact_numbers | Phone                     | "9876543210" |
+
+## Platform extraction rules:
+- For **scrape / update_field / update_multi**, set \`platform\` based on the link:
+  * instagram.com/...       → platform:"instagram", instagram_username = handle
+  * youtube.com/@handle or channel/UC… → platform:"youtube",   instagram_username = handle or channel id
+  * linkedin.com/in/slug    → platform:"linkedin",  instagram_username = slug
+  * NOTE: the field name stays "instagram_username" for backward-compat, but it carries the YT/LI handle when platform is set to those.
 
 ## Rules:
-- Bare IG link with NO action word → **search** (not scrape)
-- IG link + ANY action word (add, update, save, put in db, store) → **scrape** or **update_field**
-- IG link + "update"/"managed by"/"set"/"change" + field info → **update_field**
-- IG link + "add"/"scrape"/"save"/"put in db"/"store" → **scrape**
-- Multiple IG links + action word → **scrape**, extract FIRST username
-- update_field without IG link → default to **search** instead
-- "niche" updates: set update_field_value to ONLY the new niche (API auto-appends)
+- Bare creator link with NO action word → **search** (not scrape)
+- Link + ANY action word → **scrape** / **update_field** / **update_multi**
+- Link + ONE field update → **update_field**
+- Link + 2+ field updates → **update_multi**
+- Link + "add"/"scrape"/"save"/"put in db"/"store" → **scrape** (add \`extra_updates\` if extra fields given)
+- update_field / update_multi without a creator link → default to **search** instead
+- "niche" updates: use ONLY the new niche (API auto-appends)
 - When context is given, MERGE it into a standalone query (search engine has NO memory)
 
 ## Output Format (JSON only):
-{"action":"...","query":"...or null","instagram_username":"...or null","update_field_name":"...or null","update_field_value":"...or null","greeting_response":null,"sheet_url":"...or null"}
+{"action":"...","query":"...or null","platform":"instagram|youtube|linkedin|null","instagram_username":"...or null","update_field_name":"...or null","update_field_value":"...or null","updates":null_or_array,"extra_updates":null_or_array,"greeting_response":null,"sheet_url":"...or null"}
+
+Where \`updates\` and \`extra_updates\` are arrays of {"field":"...","value":"..."}.
 
 ## Examples:
-"hi" → {"action":"greeting","query":null,"instagram_username":null,"greeting_response":null}
-"show beauty creators in Mumbai" → {"action":"search","query":"beauty creators in Mumbai","instagram_username":null,"greeting_response":null}
-"add https://instagram.com/creator1" → {"action":"scrape","query":null,"instagram_username":"creator1","greeting_response":null}
-"https://instagram.com/creator1 managed by Rahul" → {"action":"update_field","query":null,"instagram_username":"creator1","update_field_name":"managed_by","update_field_value":"Rahul","greeting_response":null}
-"https://instagram.com/creator1 niche is Finance" → {"action":"update_field","query":null,"instagram_username":"creator1","update_field_name":"niche","update_field_value":"Finance","greeting_response":null}
-"https://instagram.com/creator1 email test@gmail.com" → {"action":"update_field","query":null,"instagram_username":"creator1","update_field_name":"mail_id","update_field_value":"test@gmail.com","greeting_response":null}
-"https://instagram.com/creator1 location Mumbai" → {"action":"update_field","query":null,"instagram_username":"creator1","update_field_name":"location","update_field_value":"Mumbai","greeting_response":null}
-"https://instagram.com/creator1 update details" → {"action":"update_field","query":null,"instagram_username":"creator1","update_field_name":null,"update_field_value":null,"greeting_response":null}
-"export to sheet" → {"action":"export","query":null,"instagram_username":null,"greeting_response":null}
-Context:"beauty creators". User:"sort by followers" → {"action":"search","query":"beauty creators sorted by followers","instagram_username":null,"greeting_response":null}
+"hi" → {"action":"greeting","query":null,"platform":null,"instagram_username":null,"greeting_response":null}
+"show beauty creators in Mumbai" → {"action":"search","query":"beauty creators in Mumbai","platform":null,"instagram_username":null,"greeting_response":null}
+"add https://instagram.com/creator1" → {"action":"scrape","query":null,"platform":"instagram","instagram_username":"creator1","extra_updates":null,"greeting_response":null}
+"add https://youtube.com/@financewithsharan" → {"action":"scrape","query":null,"platform":"youtube","instagram_username":"financewithsharan","extra_updates":null,"greeting_response":null}
+"add https://www.linkedin.com/in/sharan-hegde" → {"action":"scrape","query":null,"platform":"linkedin","instagram_username":"sharan-hegde","extra_updates":null,"greeting_response":null}
+"https://youtube.com/@mkbhd managed by AgentC" → {"action":"update_field","platform":"youtube","instagram_username":"mkbhd","update_field_name":"managed_by","update_field_value":"AgentC","greeting_response":null}
+"https://linkedin.com/in/alice-b managed by Finnet, email a@b.co, number 9876543210" → {"action":"update_multi","platform":"linkedin","instagram_username":"alice-b","updates":[{"field":"managed_by","value":"Finnet"},{"field":"mail_id","value":"a@b.co"},{"field":"contact_numbers","value":"9876543210"}],"greeting_response":null}
+"https://instagram.com/creator1 managed by Finnet Media add to db" → {"action":"scrape","platform":"instagram","instagram_username":"creator1","extra_updates":[{"field":"managed_by","value":"Finnet Media"}],"greeting_response":null}
+"https://instagram.com/creator1 niche is Finance" → {"action":"update_field","platform":"instagram","instagram_username":"creator1","update_field_name":"niche","update_field_value":"Finance","greeting_response":null}
+"https://docs.google.com/spreadsheets/d/ABC123 record in db managed by Finnet" → {"action":"bulk_import","sheet_url":"https://docs.google.com/spreadsheets/d/ABC123","platform":null,"extra_updates":[{"field":"managed_by","value":"Finnet"}],"greeting_response":null}
+"export to sheet" → {"action":"export","query":null,"platform":null,"instagram_username":null,"greeting_response":null}
+Context:"beauty creators". User:"sort by followers" → {"action":"search","query":"beauty creators sorted by followers","platform":null,"instagram_username":null,"greeting_response":null}
 `;
 
 /**
@@ -99,7 +118,9 @@ async function classifyIntent(userMessage, context = null) {
         raw = raw.replace(/```json\s*/gi, '').replace(/```/g, '').trim();
 
         const result = JSON.parse(raw);
-        console.log(`🧠 [AGENT] Intent: ${result.action} | Query: ${result.query} | IG: ${result.instagram_username}`);
+        const upd = Array.isArray(result.updates) ? result.updates.length : 0;
+        const extra = Array.isArray(result.extra_updates) ? result.extra_updates.length : 0;
+        console.log(`🧠 [AGENT] Intent: ${result.action} | platform:${result.platform || '-'} | Query: ${result.query} | handle: ${result.instagram_username} | updates:${upd} extra:${extra}`);
         return result;
 
     } catch (err) {
@@ -116,41 +137,49 @@ function fallbackClassify(text) {
     const lower = text.toLowerCase();
     console.log('⚠️ [AGENT] Using fallback classifier');
 
-    // Check for Instagram link
-    const igMatch = text.match(/instagram\.com\/(?:reel\/|p\/)?([A-Za-z0-9_.]+)/i);
-    const igUsername = igMatch ? igMatch[1].split('?')[0].split('/')[0] : null;
+    // Detect creator links across all platforms
+    let platform = null;
+    let handle = null;
 
-    // Greeting
+    const ig = text.match(/instagram\.com\/(?:reel\/|p\/|tv\/)?([A-Za-z0-9_.]+)/i);
+    if (ig) { platform = 'instagram'; handle = ig[1].split('?')[0].split('/')[0]; }
+
+    if (!handle) {
+        const yt = text.match(/youtube\.com\/@([A-Za-z0-9_.-]+)/i)
+                || text.match(/youtube\.com\/channel\/(UC[A-Za-z0-9_-]{22})/i);
+        if (yt) { platform = 'youtube'; handle = yt[1]; }
+    }
+
+    if (!handle) {
+        const li = text.match(/linkedin\.com\/in\/([A-Za-z0-9_%-]+)/i);
+        if (li) { platform = 'linkedin'; handle = decodeURIComponent(li[1]); }
+    }
+
     const greetings = ['hi', 'hello', 'hey', 'sup', 'yo', 'help', 'menu', 'hii', 'hiii', 'thanks', 'thank', 'what can you do', 'what do you do', 'features'];
     if (!text.trim() || greetings.some(g => lower === g || lower === `${g}!`)) {
-        return { action: 'greeting', query: null, instagram_username: null, greeting_response: "Hey! I'm FinBot 🤖 Ask me anything about your roster!" };
+        return { action: 'greeting', query: null, platform: null, instagram_username: null, greeting_response: "Hey! I'm FinBot 🤖 Ask me anything about your roster!" };
     }
 
-    // Export
     const exportWords = ['export', 'sheet', 'spreadsheet', 'excel', 'csv'];
-    if (exportWords.some(w => lower.includes(w))) {
-        return { action: 'export', query: null, instagram_username: null, greeting_response: null };
+    if (exportWords.some(w => lower.includes(w)) && !/docs\.google\.com\/spreadsheets/i.test(text)) {
+        return { action: 'export', query: null, platform: null, instagram_username: null, greeting_response: null };
     }
 
-    // scrape (only if IG link present + action words)
     const scrapeWords = ['scrape', 'add', 'save', 'ocr', 'scan', 'screenshot', 'put in db', 'put in the db', 'store', 'database', 'fetch'];
-    if (igUsername && scrapeWords.some(w => lower.includes(w))) {
-        return { action: 'scrape', query: null, instagram_username: igUsername, greeting_response: null };
+    if (handle && scrapeWords.some(w => lower.includes(w))) {
+        return { action: 'scrape', query: null, platform, instagram_username: handle, greeting_response: null };
     }
 
-    // If IG link present but no scrape words, DON'T auto-scrape — treat as search
-    if (igUsername) {
-        return { action: 'search', query: `show details for ${igUsername}`, instagram_username: null, greeting_response: null };
+    if (handle) {
+        return { action: 'search', query: `show details for ${handle}`, platform: null, instagram_username: null, greeting_response: null };
     }
 
-    // Google Sheet link → bulk_import
     const sheetMatch = text.match(/https?:\/\/docs\.google\.com\/spreadsheets\/d\/[a-zA-Z0-9_-]+/i);
     if (sheetMatch) {
-        return { action: 'bulk_import', query: null, instagram_username: null, sheet_url: sheetMatch[0], greeting_response: null };
+        return { action: 'bulk_import', query: null, platform: null, instagram_username: null, sheet_url: sheetMatch[0], greeting_response: null };
     }
 
-    // Default: search
-    return { action: 'search', query: text, instagram_username: null, greeting_response: null };
+    return { action: 'search', query: text, platform: null, instagram_username: null, greeting_response: null };
 }
 
 module.exports = { classifyIntent };

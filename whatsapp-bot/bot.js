@@ -26,6 +26,100 @@ const FormData = require('form-data');
 const http = require('http');
 const { BOT_NAME, TRAKR_API_URL, MAX_ROWS_IN_REPLY, MAX_MESSAGE_LENGTH, AUTH_DIR, SUPABASE_URL, SUPABASE_KEY, USE_SUPABASE_AUTH } = require('./config');
 const { classifyIntent } = require('./agent');
+const {
+    getAllowed,
+    canonicalValue,
+    formatAllowedList,
+    isSenderAllowed,
+    parseInlineUpdates,
+    refreshAllowed,
+    refreshWhitelist,
+    extractCreatorTargets,
+} = require('./validator');
+
+// ─── Platform helpers (Instagram / YouTube / LinkedIn) ─────────
+const PLATFORM_LABELS = {
+    instagram: 'Instagram',
+    youtube: 'YouTube',
+    linkedin: 'LinkedIn',
+};
+
+function platformPrefix(platform) {
+    if (platform === 'youtube') return 'YT @';
+    if (platform === 'linkedin') return 'LinkedIn ';
+    return '@';
+}
+
+function prettyTarget(platform, handle) {
+    return `${platformPrefix(platform)}${handle}`;
+}
+
+// ─── Awaiting-platform clarification state (AI search) ─────────
+// jid -> { originalQuery, expiresAt }
+const pendingClarifications = new Map();
+const CLARIFY_TTL_MS = 5 * 60 * 1000;
+
+function parsePlatformReply(text) {
+    if (!text) return null;
+    const t = text.trim().toLowerCase();
+    if (/\b(instagram|insta|ig)\b/.test(t)) return 'instagram';
+    if (/\b(youtube|yt)\b/.test(t)) return 'youtube';
+    if (/\b(linkedin|li)\b/.test(t)) return 'linkedin';
+    return null;
+}
+
+// Keywords that abort any ongoing multi-step flow (scrape/OCR/bulk import) for this chat
+const QUIT_KEYWORDS = new Set(['quit', 'cancel', 'stop', 'abort', 'exit', 'nevermind', 'never mind', 'new query']);
+function isQuitMessage(text) {
+    if (!text) return false;
+    const t = text.trim().toLowerCase().replace(/[.!?]+$/, '');
+    if (QUIT_KEYWORDS.has(t)) return true;
+    // Also catch "@finbot quit" forms
+    const stripped = t.replace(new RegExp(`^@?${BOT_NAME}\\s+`, 'i'), '').trim();
+    return QUIT_KEYWORDS.has(stripped);
+}
+
+async function resetChatState(jid, sock, quoted) {
+    // 1) Pending scrape / OCR queue
+    let hadState = false;
+    if (pendingScrapes.has(jid)) {
+        pendingScrapes.delete(jid);
+        hadState = true;
+    }
+    // 2) In-flight bulk imports for this chat
+    const toCancel = [];
+    for (const [jobId, info] of bulkImportJobs.entries()) {
+        if (info.jid === jid) toCancel.push(jobId);
+    }
+    for (const jobId of toCancel) {
+        try {
+            await fetch(`${TRAKR_API_URL}/api/bulk-import/${jobId}/cancel`, { method: 'POST' });
+            bulkImportJobs.delete(jobId);
+            hadState = true;
+        } catch (e) { /* ignore */ }
+    }
+    // 3) Clear chat history so old screenshots/links don't leak into the next query
+    chatHistory.delete(jid);
+
+    // 4) Drop any pending AI-search platform clarification
+    if (pendingClarifications.has(jid)) {
+        pendingClarifications.delete(jid);
+        hadState = true;
+    }
+
+    if (sock) {
+        const text = hadState
+            ? '🛑 Cancelled — previous session cleared. Ask me anything to start fresh.'
+            : '✅ Nothing in progress. Ready for your next query.';
+        try {
+            if (quoted) {
+                await sock.sendMessage(jid, { text }, { quoted });
+            } else {
+                await sock.sendMessage(jid, { text });
+            }
+        } catch (e) { /* ignore */ }
+    }
+}
 
 // Supabase auth (only loaded when SUPABASE_URL is configured)
 let createClient, useSupabaseAuthState;
@@ -136,6 +230,24 @@ const pendingScrapes = new Map();
 const bulkImportJobs = new Map();
 // Key: jid, Value: { queue: [{username, scraped}], current: {username, step, data}, sock }
 
+// ─── Per-JID message serialization ───
+// Messages from the SAME user are handled strictly in order (prevents
+// double-scrapes, out-of-order OCR, and interleaved state-machine bugs
+// when a user taps send multiple times rapidly). Messages from DIFFERENT
+// users still process in parallel.
+const perJidChain = new Map();
+function enqueueForJid(jid, task) {
+    const prev = perJidChain.get(jid) || Promise.resolve();
+    const next = prev.then(() => task()).catch((err) => {
+        console.error(`[PER-JID ${jid}] task error:`, err);
+    });
+    perJidChain.set(jid, next);
+    next.finally(() => {
+        if (perJidChain.get(jid) === next) perJidChain.delete(jid);
+    });
+    return next;
+}
+
 /**
  * Extract first Instagram username from text.
  */
@@ -162,17 +274,24 @@ function extractAllInstagramUsernames(text) {
 
 /**
  * Find screenshots from recent chat history.
- * Only looks back 3 messages from latest to avoid picking up old screenshots.
+ *
+ * Policy: only pick up images that were sent as a CONTIGUOUS batch IMMEDIATELY
+ * before the current trigger message. As soon as we hit a text/non-image
+ * message, we stop. This prevents screenshots from older, unrelated flows
+ * from leaking into the current one.
+ *
+ * Also caps to the last 10 to avoid runaway batches.
  */
 function findRecentScreenshots(jid) {
     const history = chatHistory.get(jid) || [];
     const images = [];
-    // Look at last 3 messages only (not the current message)
-    const start = Math.max(0, history.length - 4);
-    for (let i = history.length - 2; i >= start; i--) {
-        if (history[i]?.message?.imageMessage) {
-            images.unshift(history[i]);
-        }
+    // Start just before the current trigger message (last entry in history)
+    for (let i = history.length - 2; i >= 0 && images.length < 10; i--) {
+        const m = history[i]?.message;
+        if (!m) break;
+        const isImage = !!(m.imageMessage || m.ephemeralMessage?.message?.imageMessage);
+        if (!isImage) break;           // stop at first non-image — no "gap skipping"
+        images.unshift(history[i]);
     }
     return images;
 }
@@ -198,20 +317,43 @@ function findUsernameFromHistory(jid) {
 }
 
 /**
- * Call the Trakr scraper API (Apify).
+ * Call the Trakr scraper API for the correct platform (Apify under the hood).
+ * Accepts either a plain string (legacy; treated as Instagram) or a {platform, handle}.
  */
-async function callScraper(username) {
+async function callScraper(target) {
+    const platform = (typeof target === 'object' && target?.platform) || 'instagram';
+    const handle = typeof target === 'string' ? target : (target?.handle || '');
+
+    let url, body;
+    if (platform === 'youtube') {
+        url = `${TRAKR_API_URL}/api/scrape-youtube`;
+        body = { channel: handle };
+    } else if (platform === 'linkedin') {
+        url = `${TRAKR_API_URL}/api/scrape-linkedin`;
+        body = { profile: handle };
+    } else {
+        url = `${TRAKR_API_URL}/api/scrape-instagram`;
+        body = { username: handle };
+    }
+
     try {
-        const res = await fetch(`${TRAKR_API_URL}/api/scrape-instagram`, {
+        const res = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username }),
+            body: JSON.stringify(body),
         });
         const data = await res.json();
-        if (!res.ok) return { success: false, error: data.error || data.details || 'Scrape failed' };
-        return { success: true, data };
+        if (!res.ok) {
+            return {
+                success: false,
+                platform,
+                error: data.error || data.details || 'Scrape failed',
+                details: data.details || '',
+            };
+        }
+        return { success: true, platform, data };
     } catch (err) {
-        return { success: false, error: err.message };
+        return { success: false, platform, error: err.message };
     }
 }
 
@@ -352,31 +494,59 @@ function formatReply(data) {
     if (!data || data.type === 'error') {
         return `❌ *Error:* ${data?.message || 'Something went wrong.'}`;
     }
+
+    if (data.type === 'clarify') {
+        return `🤔 ${data.message || 'Which platform did you mean — Instagram, YouTube, or LinkedIn?'}\n\n_Reply with one of:_ *instagram* / *youtube* / *linkedin*`;
+    }
+
     let msg = '';
 
-    // Insight display removed - show data directly
-        if (data.data && data.data.length > 0) {
+    if (data.data && data.data.length > 0) {
         const allRows = data.data;
+        const platform = data.platform || 'instagram';
+        const platformLabel = platform === 'youtube' ? 'YouTube' : platform === 'linkedin' ? 'LinkedIn' : 'Instagram';
 
-        msg += `📊 *Results* (${allRows.length} found):\n\n`;
+        msg += `📊 *${platformLabel} Results* (${allRows.length} found):\n\n`;
+
         allRows.forEach((row, i) => {
-            const name = row.creator_name || row.username || 'Unknown';
-            const username = row.username ? `@${row.username}` : '';
-            const niche = row.niche || '-';
-            const followers = formatNumber(row.followers);
-            const avgViews = formatNumber(row.avg_views);
-
-            msg += `*${i + 1}. ${name}* ${username}\n`;
-            msg += `   Niche: ${niche} | Followers: ${followers} | Avg Views: ${avgViews}\n\n`;
+            let line;
+            if (platform === 'youtube') {
+                const name = row.channel_name || row.channel_handle || 'Unknown';
+                const handle = row.channel_handle ? `@${row.channel_handle}` : '';
+                const niche = row.niche || '-';
+                const subs = formatNumber(row.subscribers);
+                const views = formatNumber(row.avg_long_views);
+                line = `*${i + 1}. ${name}* ${handle}\n   Niche: ${niche} | Subs: ${subs} | Avg Long Views: ${views}\n\n`;
+            } else if (platform === 'linkedin') {
+                const name = row.full_name || row.profile_id || 'Unknown';
+                const handle = row.profile_id ? `(${row.profile_id})` : '';
+                const headline = row.headline ? `\n   _${row.headline}_` : '';
+                const company = row.current_company ? `\n   🏢 ${row.current_company}` : '';
+                const conns = formatNumber(row.connections);
+                line = `*${i + 1}. ${name}* ${handle}${headline}${company}\n   🔗 Connections: ${conns}\n\n`;
+            } else {
+                const name = row.creator_name || row.username || 'Unknown';
+                const username = row.username ? `@${row.username}` : '';
+                const niche = row.niche || '-';
+                const followers = formatNumber(row.followers);
+                const avgViews = formatNumber(row.avg_views);
+                line = `*${i + 1}. ${name}* ${username}\n   Niche: ${niche} | Followers: ${followers} | Avg Views: ${avgViews}\n\n`;
+            }
 
             // Safety: if message is getting too long, stop adding rows
-            if (msg.length > MAX_MESSAGE_LENGTH - 200) {
-                msg += `\n... _(${allRows.length - i - 1} more — use dashboard for full list)_\n`;
+            if (msg.length + line.length > MAX_MESSAGE_LENGTH - 200) {
+                msg += `\n... _(${allRows.length - i} more — use dashboard for full list)_\n`;
                 return;
             }
+            msg += line;
         });
+
+        // Prepend insight if present and concise
+        if (data.insight && data.insight.length > 0 && data.insight.length < 600) {
+            msg = `💡 ${data.insight}\n\n` + msg;
+        }
     } else {
-        msg += '📭 No results found.';
+        msg += data.insight || '📭 No results found.';
     }
 
     if (msg.length > MAX_MESSAGE_LENGTH) {
@@ -385,12 +555,14 @@ function formatReply(data) {
     return msg.trim();
 }
 
-async function queryTrakr(query) {
+async function queryTrakr(query, platform = null) {
     try {
+        const body = { query };
+        if (platform) body.platform = platform;
         const res = await fetch(`${TRAKR_API_URL}/api/custom-search`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query }),
+            body: JSON.stringify(body),
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
@@ -501,7 +673,20 @@ async function startBot() {
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
 
+        // Fire each message into its per-JID queue without awaiting — different
+        // users process in parallel, same user processes strictly in order.
         for (const msg of messages) {
+            const _jid = msg?.key?.remoteJid;
+            if (!_jid) continue;
+            enqueueForJid(_jid, () => handleIncomingMessage(sock, msg));
+        }
+    });
+
+    async function handleIncomingMessage(sock, msg) {
+        // Single-iteration inner loop: lets the legacy `continue;` statements
+        // inside the handler act as early-exits from this message without
+        // us having to rewrite 30+ call sites.
+        for (const _ of [0]) {
             try {
                 console.log(`\n🔍 [DEBUG] RAW MSG received from: ${msg.key.remoteJid} | fromMe: ${msg.key.fromMe}`);
 
@@ -522,6 +707,18 @@ async function startBot() {
                     continue;
                 }
 
+                // ─── WHITELIST GATE ───
+                // If enforcement is ON and sender isn't in the whitelist, silently ignore.
+                try {
+                    const gate = await isSenderAllowed(msg);
+                    if (gate.enabled && !gate.allowed) {
+                        console.log(`🚫 [WHITELIST] Blocked sender ${gate.phone || '(unknown)'} for jid ${jid}`);
+                        continue;
+                    }
+                } catch (e) {
+                    console.warn('[WHITELIST] Gate check failed, allowing message:', e.message);
+                }
+
                 // Extract text from ALL possible WhatsApp message types (including expiring/ephemeral messages)
                 const text = msg.message?.conversation
                     || msg.message?.extendedTextMessage?.text
@@ -534,6 +731,38 @@ async function startBot() {
 
                 const hasImage = !!(msg.message?.imageMessage || msg.message?.ephemeralMessage?.message?.imageMessage);
                 console.log(`💬 [DEBUG] Extracted Text: "${text}" | Has Image: ${hasImage}`);
+
+                // ─── QUIT / CANCEL KEYWORD ───
+                // Fully resets any pending state (scrape queue, bulk import, history).
+                if (text && isQuitMessage(text)) {
+                    console.log(`🛑 [QUIT] Resetting state for ${jid}`);
+                    pendingClarifications.delete(jid);
+                    await resetChatState(jid, sock, msg);
+                    continue;
+                }
+
+                // ─── PENDING PLATFORM CLARIFICATION ───
+                // If we recently asked "which platform?", treat this reply as the answer
+                // and re-run the original query with the chosen platform.
+                if (text && pendingClarifications.has(jid)) {
+                    const pc = pendingClarifications.get(jid);
+                    if (pc.expiresAt && Date.now() > pc.expiresAt) {
+                        pendingClarifications.delete(jid);
+                    } else {
+                        const chosen = parsePlatformReply(text);
+                        if (chosen) {
+                            pendingClarifications.delete(jid);
+                            await sock.sendMessage(jid, { react: { text: '🔎', key: msg.key } });
+                            const result = await queryTrakr(pc.originalQuery, chosen);
+                            await sock.sendMessage(jid, { text: formatReply(result) }, { quoted: msg });
+                            await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
+                            continue;
+                        }
+                        // Not a platform keyword — let the normal pipeline handle it
+                        // but clear the pending state so we don't keep asking.
+                        pendingClarifications.delete(jid);
+                    }
+                }
 
                 // ─── HANDLE SCREENSHOTS DURING PENDING SCRAPE ───
                 // If we're awaiting screenshots and user sends an image, process it immediately
@@ -600,27 +829,83 @@ async function startBot() {
                             }
                         }
 
+                        // Merge in any fields the user already gave us earlier (extra_updates)
+                        const pre = pending.current.prefilled || {};
+                        if (!language && pre.language) language = pre.language;
+                        if (!niche && pre.niche) niche = pre.niche;
+                        if (!gender && pre.gender) gender = pre.gender;
+
                         if (!language || !niche || !gender) {
+                            const missing = [];
+                            if (!language) missing.push('Language');
+                            if (!niche) missing.push('Niche');
+                            if (!gender) missing.push('Gender');
                             await sock.sendMessage(jid, {
-                                text: `⚠️ I need all 3 fields. Please reply like this:\n\nLanguage: Hindi\nNiche: Finance\nGender: Male\n\n_Or in one line:_ Hindi, Finance, Male`
+                                text: `⚠️ Still need: *${missing.join(', ')}*.\n\nReply like this:\nLanguage: Hindi\nNiche: Finance\nGender: Male\n\n_Or one line:_ Hindi, Finance, Male`
                             }, { quoted: msg });
                             continue;
                         }
 
-                        // Update the DB with mandatory fields
-                        const username = pending.current.username;
-                        try {
-                            for (const [field, value] of [['language', language], ['niche', niche], ['gender', gender]]) {
-                                await fetch(`${TRAKR_API_URL}/api/update-field`, {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ username, field, value })
-                                });
+                        // ── VALIDATE against allowed lists ──
+                        const [canonLang, canonNiche, canonGender] = await Promise.all([
+                            canonicalValue('language', language),
+                            canonicalValue('niche', niche),
+                            canonicalValue('gender', gender),
+                        ]);
+                        const invalid = [];
+                        if (!canonLang) invalid.push({ f: 'Language', given: language, allowed: await getAllowed('language') });
+                        if (!canonNiche) invalid.push({ f: 'Niche', given: niche, allowed: await getAllowed('niche') });
+                        if (!canonGender) invalid.push({ f: 'Gender', given: gender, allowed: await getAllowed('gender') });
+
+                        if (invalid.length) {
+                            let txt = `❌ These values aren't allowed:\n`;
+                            for (const inv of invalid) {
+                                txt += `\n• *${inv.f}:* "${inv.given}"\n   _Allowed:_ ${formatAllowedList(inv.allowed)}`;
                             }
-                            await sock.sendMessage(jid, {
-                                text: `${randomFrom(REACTIONS.success)} *@${username}* updated!\n   Language: ${language}\n   Niche: ${niche}\n   Gender: ${gender}\n\n📸 _Want to share analytics screenshots for more data? Send them now, or type "skip" to move on._`
-                            }, { quoted: msg });
-                            pending.current.step = 'awaiting_screenshots';
+                            txt += `\n\n🔁 Please reply again with valid values.`;
+                            await sock.sendMessage(jid, { text: txt }, { quoted: msg });
+                            continue;
+                        }
+
+                        const username = pending.current.username;
+                        const platform = pending.current.platform || 'instagram';
+                        const label = prettyTarget(platform, username);
+                        try {
+                            const res = await fetch(`${TRAKR_API_URL}/api/update-fields`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    username,
+                                    platform,
+                                    updates: [
+                                        { field: 'language', value: canonLang },
+                                        { field: 'niche',    value: canonNiche },
+                                        { field: 'gender',   value: canonGender },
+                                    ]
+                                })
+                            });
+                            const data = await res.json();
+                            if (!res.ok || !data.success) {
+                                throw new Error(data.error || data.details || 'update failed');
+                            }
+                            // OCR/screenshot step only applies to Instagram
+                            if (platform === 'instagram') {
+                                await sock.sendMessage(jid, {
+                                    text: `${randomFrom(REACTIONS.success)} *${label}* updated!\n   Language: ${canonLang}\n   Niche: ${canonNiche}\n   Gender: ${canonGender}\n\n📸 _Want to share analytics screenshots for more data? Send them now, or type "skip" to move on. Type "quit" to start over._`
+                                }, { quoted: msg });
+                                pending.current.step = 'awaiting_screenshots';
+                            } else {
+                                await sock.sendMessage(jid, {
+                                    text: `${randomFrom(REACTIONS.success)} *${label}* updated!\n   Language: ${canonLang}\n   Niche: ${canonNiche}\n   Gender: ${canonGender}`
+                                }, { quoted: msg });
+                                // Move on — no OCR step for YT/LI
+                                const next = pending.queue.shift();
+                                if (next) {
+                                    await processScrapeForUser(sock, jid, msg, next, pending);
+                                } else {
+                                    pendingScrapes.delete(jid);
+                                }
+                            }
                         } catch (e) {
                             await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} Failed to update fields: ${e.message}` }, { quoted: msg });
                             pendingScrapes.delete(jid);
@@ -631,10 +916,9 @@ async function startBot() {
                     if (pending.current && pending.current.step === 'awaiting_screenshots') {
                         const lower = text.toLowerCase().trim();
                         if (lower === 'skip' || lower === 'no' || lower === 'next' || lower === 'done') {
-                            // Move to next in queue
-                            const nextUsername = pending.queue.shift();
-                            if (nextUsername) {
-                                await processScrapeForUser(sock, jid, msg, nextUsername, pending);
+                            const next = pending.queue.shift();
+                            if (next) {
+                                await processScrapeForUser(sock, jid, msg, next, pending);
                             } else {
                                 await sock.sendMessage(jid, { text: `✅ *All done!* All creators have been processed. 🎉` }, { quoted: msg });
                                 pendingScrapes.delete(jid);
@@ -642,9 +926,9 @@ async function startBot() {
                             continue;
                         }
 
-                        // Any other text while awaiting screenshots — remind them
+                        const curLabel = prettyTarget(pending.current.platform || 'instagram', pending.current.username);
                         await sock.sendMessage(jid, {
-                            text: `📸 I'm waiting for analytics screenshots for *@${pending.current.username}*. Send screenshot images, or type "done" to move on.`
+                            text: `📸 I'm waiting for analytics screenshots for *${curLabel}*. Send screenshot images, or type "done" to move on.`
                         }, { quoted: msg });
                         continue;
                     }
@@ -689,12 +973,13 @@ async function startBot() {
                     }
                 }
 
-                // Check for IG links
+                // Check for creator links (IG + YT + LI)
+                const targetsFromText = extractCreatorTargets(text);
                 const igFromText = extractInstagramUsername(text);
                 const allIgUsernames = extractAllInstagramUsernames(text);
                 const historyIgUsername = findUsernameFromHistory(jid);
 
-                console.log(`🧠 [PRE-AGENT] Query: "${query}" | IG links: ${allIgUsernames.length} | Context: ${agentContext ? 'yes' : 'none'}`);
+                console.log(`🧠 [PRE-AGENT] Query: "${query}" | targets: ${targetsFromText.length} (${targetsFromText.map(t => `${t.platform}:${t.handle}`).join(', ')}) | Context: ${agentContext ? 'yes' : 'none'}`);
 
                 // ─── AGENT: CLASSIFY INTENT ───
                 await sock.sendMessage(jid, { react: { text: randomFrom(REACTIONS.thinking), key: msg.key } });
@@ -761,94 +1046,172 @@ async function startBot() {
                 }
 
                 // ═══════════════════════════════════════════
+                // ACTION: UPDATE_MULTI (multiple fields in one go)
+                // ═══════════════════════════════════════════
+                if (intent.action === 'update_multi') {
+                    // Resolve platform + handle: prefer explicit target from text, then LLM-provided
+                    let platform, username;
+                    if (targetsFromText.length) {
+                        platform = targetsFromText[0].platform;
+                        username = targetsFromText[0].handle;
+                    } else {
+                        platform = intent.platform || 'instagram';
+                        username = intent.instagram_username || historyIgUsername;
+                    }
+                    if (!username && agentContext) {
+                        const ctxTargets = extractCreatorTargets(agentContext);
+                        if (ctxTargets.length) { platform = ctxTargets[0].platform; username = ctxTargets[0].handle; }
+                    }
+
+                    let updates = Array.isArray(intent.updates) ? intent.updates : [];
+                    const parsed = parseInlineUpdates(text);
+                    for (const p of parsed) {
+                        if (!updates.find(u => u.field === p.field)) updates.push(p);
+                    }
+
+                    if (!username) {
+                        await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} I need a creator link (Instagram / YouTube / LinkedIn) to update multiple fields.` }, { quoted: msg });
+                        await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
+                        continue;
+                    }
+                    if (!updates.length) {
+                        await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} I couldn't find any fields to update. Try: "managed by X, email Y, number Z".` }, { quoted: msg });
+                        await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
+                        continue;
+                    }
+
+                    await sock.sendMessage(jid, { react: { text: '✍️', key: msg.key } });
+                    const result = await applyBulkUpdates(username, updates, platform);
+                    await sock.sendMessage(jid, { text: result.ok ? result.appliedLabel : result.errorText }, { quoted: msg });
+                    await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
+                    continue;
+                }
+
+                // ═══════════════════════════════════════════
                 // ACTION: UPDATE_FIELD (modify DB column)
                 // ═══════════════════════════════════════════
                 if (intent.action === 'update_field') {
-                    // Extract username: try agent > IG link in text > IG link from quoted context > history
-                    let username = intent.instagram_username || igFromText || historyIgUsername;
-
-                    // Also try to extract from quoted message context if available
+                    // Resolve platform + handle
+                    let platform, username;
+                    if (targetsFromText.length) {
+                        platform = targetsFromText[0].platform;
+                        username = targetsFromText[0].handle;
+                    } else {
+                        platform = intent.platform || 'instagram';
+                        username = intent.instagram_username || historyIgUsername;
+                    }
                     if (!username && agentContext) {
-                        username = extractInstagramUsername(agentContext);
+                        const ctxTargets = extractCreatorTargets(agentContext);
+                        if (ctxTargets.length) { platform = ctxTargets[0].platform; username = ctxTargets[0].handle; }
                     }
 
                     const field = intent.update_field_name;
                     const value = intent.update_field_value;
 
-                    // If user sent a link + "update this person details" but no specific field/value,
-                    // SCRAPE the profile first (to get name/followers/etc), then ask for mandatory fields
+                    // Inline-parser safety net: 2+ fields in one message → bulk apply
+                    const parsedExtras = parseInlineUpdates(text);
+                    if (username && parsedExtras.length >= 2) {
+                        if (field && value && !parsedExtras.find(p => p.field === field)) {
+                            parsedExtras.push({ field, value });
+                        }
+                        await sock.sendMessage(jid, { react: { text: '✍️', key: msg.key } });
+                        const result = await applyBulkUpdates(username, parsedExtras, platform);
+                        await sock.sendMessage(jid, { text: result.ok ? result.appliedLabel : result.errorText }, { quoted: msg });
+                        await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
+                        continue;
+                    }
+
+                    // Link + "update this person details" with no explicit field → scrape first
                     if (username && (!field || value === undefined || value === null)) {
                         const pending = { queue: [], current: null };
                         pendingScrapes.set(jid, pending);
-                        
-                        // Scrape the profile first to get basic data
-                        await processScrapeForUser(sock, jid, msg, username, pending);
-                        
+                        await processScrapeForUser(sock, jid, msg, { platform, handle: username }, pending);
                         await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
                         continue;
                     }
 
                     if (!username || !field || value === undefined || value === null) {
-                        await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} I need the creator's Instagram link or username, the field, and the new value to update correctly.` }, { quoted: msg });
+                        await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} I need a creator link (IG/YT/LI), the field, and the new value to update correctly.` }, { quoted: msg });
                         await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
                         continue;
                     }
 
                     await sock.sendMessage(jid, { react: { text: '✍️', key: msg.key } });
 
+                    if (field === 'niche' || field === 'language' || field === 'gender') {
+                        const canon = await canonicalValue(field, value);
+                        if (!canon) {
+                            const allowed = await getAllowed(field);
+                            await sock.sendMessage(jid, {
+                                text: `❌ "${value}" is not a valid ${field}.\n_Allowed:_ ${formatAllowedList(allowed)}\n\n🔁 Please send again with an allowed value.`
+                            }, { quoted: msg });
+                            await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
+                            continue;
+                        }
+                    }
+
                     try {
                         const res = await fetch(`${TRAKR_API_URL}/api/update-field`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ username, field, value })
+                            body: JSON.stringify({ username, field, value, platform })
                         });
                         const data = await res.json();
-                        
+
                         if (res.ok && data.success) {
                             await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.success)} ${data.message}` }, { quoted: msg });
+                        } else if (data.allowed) {
+                            await sock.sendMessage(jid, {
+                                text: `❌ "${data.invalid_value}" is not a valid ${data.field}.\n_Allowed:_ ${formatAllowedList(data.allowed)}`
+                            }, { quoted: msg });
                         } else {
                             await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} Field update failed: ${data.error}` }, { quoted: msg });
                         }
                     } catch (e) {
                          await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} Error saving to database: ${e.message}` }, { quoted: msg });
                     }
-                    
+
                     await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
                     continue;
                 }
 
                 // ═══════════════════════════════════════════
-                // ACTION: SCRAPE (fetch from Instagram)
+                // ACTION: SCRAPE (fetch from Instagram / YouTube / LinkedIn)
                 // ═══════════════════════════════════════════
                 if (intent.action === 'scrape') {
-                    // Collect all IG usernames: from text > agent extraction > history
-                    let usernames = allIgUsernames.length > 0
-                        ? allIgUsernames
-                        : (intent.instagram_username ? [intent.instagram_username] : []);
+                    // Collect all targets from text first (supports multi-platform batches)
+                    let targets = targetsFromText.slice();
+                    if (!targets.length && intent.instagram_username) {
+                        targets = [{ platform: intent.platform || 'instagram', handle: intent.instagram_username }];
+                    }
 
-                    if (usernames.length === 0 && igFromText) usernames = [igFromText];
-                    // Don't fall back to history — user must provide links explicitly for scraping
-
-                    if (usernames.length === 0) {
+                    if (!targets.length) {
                         await sock.sendMessage(jid, { text: quip('noLink') }, { quoted: msg });
                         await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
                         continue;
                     }
 
-                    if (usernames.length > 1) {
+                    if (targets.length > 1) {
+                        const list = targets.map((t, i) => `${i + 1}. ${prettyTarget(t.platform, t.handle)} _(${PLATFORM_LABELS[t.platform]})_`).join('\n');
                         await sock.sendMessage(jid, {
-                            text: `📋 *Found ${usernames.length} Instagram profiles!* I'll process them one by one.\n\n${usernames.map((u, i) => `${i + 1}. @${u}`).join('\n')}`
+                            text: `📋 *Found ${targets.length} creator link${targets.length === 1 ? '' : 's'}!* I'll process them one by one.\n\n${list}`
                         }, { quoted: msg });
                     }
 
-                    // Set up the queue: first goes to processing, rest wait
+                    let extraUpdates = Array.isArray(intent.extra_updates) ? intent.extra_updates.slice() : [];
+                    const parsedFromText = parseInlineUpdates(text);
+                    for (const p of parsedFromText) {
+                        if (!extraUpdates.find(u => u.field === p.field)) extraUpdates.push(p);
+                    }
+
                     const pending = {
-                        queue: usernames.slice(1),
+                        queue: targets.slice(1),
                         current: null,
+                        extraUpdates,
                     };
                     pendingScrapes.set(jid, pending);
 
-                    await processScrapeForUser(sock, jid, msg, usernames[0], pending);
+                    await processScrapeForUser(sock, jid, msg, targets[0], pending);
 
                     await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
                     continue;
@@ -872,6 +1235,32 @@ async function startBot() {
                         continue;
                     }
 
+                    // ── Parse any inline field updates from the same message ──
+                    // These will be applied as DEFAULTS to every imported row.
+                    // e.g. "<sheet url> managed by Finnet Media"
+                    let applyToAll = Array.isArray(intent.extra_updates) ? intent.extra_updates.slice() : [];
+                    const parsedFromSheetMsg = parseInlineUpdates(text);
+                    for (const p of parsedFromSheetMsg) {
+                        if (!applyToAll.find(u => u.field === p.field)) applyToAll.push(p);
+                    }
+
+                    // Validate controlled-vocab values client-side for clean errors
+                    const { valid: validDefaults, invalid: invalidDefaults } = await prevalidateUpdates(applyToAll);
+                    if (invalidDefaults.length) {
+                        await sock.sendMessage(jid, {
+                            text: `❌ Can't start import — these values aren't allowed:${formatInvalidList(invalidDefaults)}\n\n🔁 Please send again with valid values.`
+                        }, { quoted: msg });
+                        await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
+                        continue;
+                    }
+
+                    if (validDefaults.length) {
+                        const summary = validDefaults.map(d => `${d.field} → ${d.value}`).join(', ');
+                        await sock.sendMessage(jid, {
+                            text: `🧩 *Applying to every row:* ${summary}\n_(sheet values will win where both are present)_`
+                        }, { quoted: msg });
+                    }
+
                     try {
                         const importRes = await fetch(`${TRAKR_API_URL}/api/bulk-import`, {
                             method: 'POST',
@@ -879,6 +1268,7 @@ async function startBot() {
                             body: JSON.stringify({
                                 sheet_url: sheetUrl,
                                 callback_url: 'http://127.0.0.1:3002/bulk-callback',
+                                apply_to_all: validDefaults,
                             }),
                         });
                         const startResult = await importRes.json();
@@ -903,22 +1293,23 @@ async function startBot() {
                     continue;
                 }
 
-                // ─── SAFETY NET: Override search to scrape if IG links + action words present ───
-                if (intent.action === 'search' && allIgUsernames.length > 0) {
+                // ─── SAFETY NET: Override search to scrape if creator links + action words present ───
+                if (intent.action === 'search' && targetsFromText.length > 0) {
                     const scrapeKeywords = /\b(add|put|store|save|scrape|fetch|database|db)\b/i;
                     if (scrapeKeywords.test(text)) {
-                        console.log('[OVERRIDE] LLM said search but text has IG links + action words -> scrape');
+                        console.log('[OVERRIDE] LLM said search but text has creator links + action words -> scrape');
                         intent.action = 'scrape';
-                        intent.instagram_username = allIgUsernames[0];
-                        let usernames = allIgUsernames;
-                        if (usernames.length > 1) {
+                        const targets = targetsFromText.slice();
+                        if (targets.length > 1) {
+                            const list = targets.map((t, i) => `${i + 1}. ${prettyTarget(t.platform, t.handle)} _(${PLATFORM_LABELS[t.platform]})_`).join('\n');
                             await sock.sendMessage(jid, {
-                                text: `Found ${usernames.length} Instagram profiles! Processing one by one.\n\n${usernames.map((u, i) => `${i + 1}. @${u}`).join('\n')}`
+                                text: `📋 *Found ${targets.length} creator links!* Processing one by one.\n\n${list}`
                             }, { quoted: msg });
                         }
-                        const pending = { queue: usernames.slice(1), current: null };
+                        const extraUpdates = parseInlineUpdates(text);
+                        const pending = { queue: targets.slice(1), current: null, extraUpdates };
                         pendingScrapes.set(jid, pending);
-                        await processScrapeForUser(sock, jid, msg, usernames[0], pending);
+                        await processScrapeForUser(sock, jid, msg, targets[0], pending);
                         await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
                         continue;
                     }
@@ -929,8 +1320,18 @@ async function startBot() {
                 // ═══════════════════════════════════════════
                 const searchQuery = intent.query || query;
                 const result = await queryTrakr(searchQuery);
-                await sock.sendMessage(jid, { text: formatReply(result) }, { quoted: msg });
-                console.log(`✅ Search: "${searchQuery}"`);
+
+                // If the backend needs platform disambiguation, store state + ask
+                if (result && result.type === 'clarify') {
+                    pendingClarifications.set(jid, {
+                        originalQuery: searchQuery,
+                        expiresAt: Date.now() + CLARIFY_TTL_MS,
+                    });
+                    await sock.sendMessage(jid, { text: formatReply(result) }, { quoted: msg });
+                } else {
+                    await sock.sendMessage(jid, { text: formatReply(result) }, { quoted: msg });
+                }
+                console.log(`✅ Search: "${searchQuery}"${result?.type === 'clarify' ? ' (awaiting platform)' : ''}`);
 
                 await sock.sendMessage(jid, { react: { text: '', key: msg.key } });
 
@@ -943,33 +1344,141 @@ async function startBot() {
                 } catch (e) { /* ignore send error */ }
             }
         }
-    });
+    }
 }
 
 /**
- * Process a single scrape: scrape profile → OCR screenshots → ask mandatory fields.
+ * Pre-validate a list of updates against the allowed vocabulary.
+ * Returns { valid: [...], invalid: [...] }
  */
-async function processScrapeForUser(sock, jid, msg, username, pending) {
-    const screenshots = findRecentScreenshots(jid);
+async function prevalidateUpdates(updates) {
+    const valid = [], invalid = [];
+    for (const u of (updates || [])) {
+        const field = (u.field || '').trim();
+        const value = u.value;
+        if (!field || value === undefined || value === null || String(value).trim() === '') continue;
+        if (field === 'niche' || field === 'language' || field === 'gender') {
+            const canon = await canonicalValue(field, value);
+            if (!canon) {
+                invalid.push({ field, value, allowed: await getAllowed(field) });
+                continue;
+            }
+            valid.push({ field, value: canon });
+        } else {
+            valid.push({ field, value: String(value).trim() });
+        }
+    }
+    return { valid, invalid };
+}
+
+function formatInvalidList(invalid) {
+    let txt = '';
+    for (const inv of invalid) {
+        txt += `\n• *${inv.field}:* "${inv.value}"\n   _Allowed:_ ${formatAllowedList(inv.allowed)}`;
+    }
+    return txt;
+}
+
+/**
+ * Apply a set of field updates for a creator via /api/update-fields.
+ * Handles validation + per-field rejection reporting.
+ * Returns { ok, appliedLabel, errorText }.
+ */
+async function applyBulkUpdates(username, updates, platform = 'instagram') {
+    const { valid, invalid } = await prevalidateUpdates(updates);
+    if (!valid.length) {
+        return {
+            ok: false,
+            errorText: invalid.length
+                ? `❌ No valid updates. Invalid values:${formatInvalidList(invalid)}\n\n🔁 Please send again with allowed values.`
+                : `❌ Nothing to update.`,
+        };
+    }
+    try {
+        const res = await fetch(`${TRAKR_API_URL}/api/update-fields`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, updates: valid, platform }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+            return { ok: false, errorText: `❌ ${data.error || data.details || `HTTP ${res.status}`}` };
+        }
+        const applied = (data.applied || []).map(a => `${a.field} → ${a.value}`);
+        const rejected = (data.rejected || []);
+        const label = prettyTarget(platform, username);
+        let txt = `✅ *${label}* updated (${applied.length} field${applied.length === 1 ? '' : 's'}):\n` +
+            applied.map(a => `   • ${a}`).join('\n');
+        if (rejected.length) {
+            txt += `\n\n⚠️ Rejected:`;
+            for (const r of rejected) {
+                const allowed = r.allowed ? `\n     _Allowed:_ ${formatAllowedList(r.allowed)}` : '';
+                txt += `\n   • ${r.field}="${r.value}" — ${r.reason}${allowed}`;
+            }
+        }
+        // Also surface pre-validated invalids (if any)
+        if (invalid.length) {
+            txt += `\n\n⚠️ Not sent (invalid values):${formatInvalidList(invalid)}`;
+        }
+        return { ok: true, appliedLabel: txt };
+    } catch (e) {
+        return { ok: false, errorText: `❌ Error: ${e.message}` };
+    }
+}
+
+/**
+ * Process a single scrape: scrape profile → OCR screenshots (IG only) → ask mandatory fields.
+ * target = { platform, handle } OR legacy string (treated as instagram).
+ */
+async function processScrapeForUser(sock, jid, msg, target, pending) {
+    // Normalize target
+    const tgt = typeof target === 'string' ? { platform: 'instagram', handle: target } : target;
+    const platform = tgt.platform || 'instagram';
+    const username = tgt.handle;
+    const label = prettyTarget(platform, username);
+
+    // OCR is IG-only (analytics screenshots format is IG-specific)
+    const screenshots = platform === 'instagram' ? findRecentScreenshots(jid) : [];
     const hasScreenshots = screenshots.length > 0;
 
     await sock.sendMessage(jid, {
-        text: `${quip('scrapeStart')}\n\n👤 Target: *@${username}*${hasScreenshots ? `\n📸 Screenshots found: *${screenshots.length}*` : ''}`,
+        text: `${quip('scrapeStart')}\n\n👤 Target: *${label}* _(${PLATFORM_LABELS[platform]})_${hasScreenshots ? `\n📸 Screenshots found: *${screenshots.length}*` : ''}`,
     }, { quoted: msg });
 
-    const scrapeResult = await callScraper(username);
+    const scrapeResult = await callScraper(tgt);
     let reply = '';
 
     if (scrapeResult.success) {
         const d = scrapeResult.data;
         reply += `${randomFrom(QUIPS.scrapeSuccess)}\n`;
-        reply += `   👤 *${d.creatorName || username}*\n`;
-        reply += `   👥 Followers: *${formatNumber(d.followers)}*\n\n`;
+        if (platform === 'youtube') {
+            reply += `   📺 *${d.channelName || username}*\n`;
+            reply += `   👥 Subscribers: *${formatNumber(d.subscribers)}*\n\n`;
+        } else if (platform === 'linkedin') {
+            reply += `   💼 *${d.fullName || username}*\n`;
+            if (d.headline) reply += `   _${d.headline}_\n`;
+            reply += `\n`;
+        } else {
+            reply += `   👤 *${d.creatorName || username}*\n`;
+            reply += `   👥 Followers: *${formatNumber(d.followers)}*\n\n`;
+        }
+    } else if (scrapeResult.error && scrapeResult.error.includes('Insufficient Data')) {
+        reply += `⚠️ *${label}* doesn't have enough public data to calculate metrics.\n`;
+        reply += `_${scrapeResult.details || scrapeResult.error}_\n`;
+        reply += `❌ *Creator was NOT added to the database.*\n\n`;
+        await sock.sendMessage(jid, { text: reply.trim() }, { quoted: msg });
+        const next = pending.queue.shift();
+        if (next) {
+            await processScrapeForUser(sock, jid, msg, next, pending);
+        } else {
+            pendingScrapes.delete(jid);
+        }
+        return;
     } else {
         reply += `${randomFrom(REACTIONS.fail)} Scrape hiccup: ${scrapeResult.error}\n\n`;
     }
 
-    // OCR if screenshots are present (only from last 3 messages)
+    // OCR if screenshots are present (Instagram only)
     if (hasScreenshots) {
         let ocrSuccess = 0;
         let extractedFields = [];
@@ -1001,34 +1510,75 @@ async function processScrapeForUser(sock, jid, msg, username, pending) {
 
     await sock.sendMessage(jid, { text: reply.trim() });
 
-    // Check if creator already exists in DB with mandatory fields filled
-    let needMandatory = true;
-    try {
-        const existingRes = await fetch(`${TRAKR_API_URL}/api/roster/${username}`);
-        if (existingRes.ok) {
-            const existing = await existingRes.json();
-            if (existing && existing.language && existing.niche && existing.gender) {
-                needMandatory = false;
-                console.log(`[SCRAPE] @${username} already has mandatory fields, skipping prompt`);
-                await sock.sendMessage(jid, {
-                    text: `@${username} already has all details in DB! Scrape data updated.`
-                });
+    // ── Apply any extra_updates the user gave alongside the scrape link ──
+    const extras = Array.isArray(pending.extraUpdates) ? pending.extraUpdates : [];
+    const prefilled = {};
+
+    if (scrapeResult.success && extras.length) {
+        const bulk = await applyBulkUpdates(username, extras, platform);
+        if (bulk.ok) {
+            await sock.sendMessage(jid, { text: bulk.appliedLabel });
+            for (const e of extras) {
+                if (e.field === 'language' || e.field === 'niche' || e.field === 'gender') {
+                    const canon = await canonicalValue(e.field, e.value);
+                    if (canon) prefilled[e.field] = canon;
+                }
             }
+        } else {
+            await sock.sendMessage(jid, { text: `⚠️ Couldn't apply inline updates.\n${bulk.errorText}` });
         }
-    } catch (e) {
-        console.error('[SCRAPE] Error checking existing creator:', e.message);
+    }
+
+    // Check existing row for mandatory fields (IG only for now — YT/LI lookup endpoints differ)
+    let needMandatory = true;
+    let existingRow = null;
+    if (platform === 'instagram') {
+        try {
+            const existingRes = await fetch(`${TRAKR_API_URL}/api/roster/${username}`);
+            if (existingRes.ok) {
+                existingRow = await existingRes.json();
+                if (existingRow && existingRow.language && existingRow.niche && existingRow.gender) {
+                    needMandatory = false;
+                    console.log(`[SCRAPE] ${label} already has mandatory fields, skipping prompt`);
+                    await sock.sendMessage(jid, {
+                        text: `${label} already has all details in DB! Scrape data updated.`
+                    });
+                }
+            }
+        } catch (e) {
+            console.error('[SCRAPE] Error checking existing creator:', e.message);
+        }
+    }
+
+    if (existingRow) {
+        if (!prefilled.language && existingRow.language) prefilled.language = existingRow.language;
+        if (!prefilled.niche && existingRow.niche) prefilled.niche = existingRow.niche;
+        if (!prefilled.gender && existingRow.gender) prefilled.gender = existingRow.gender;
+    }
+
+    if (needMandatory && prefilled.language && prefilled.niche && prefilled.gender) {
+        needMandatory = false;
+        await sock.sendMessage(jid, {
+            text: `✅ ${label} finalized with given details (Language: ${prefilled.language}, Niche: ${prefilled.niche}, Gender: ${prefilled.gender}).`
+        });
     }
 
     if (needMandatory) {
-        pending.current = { username, step: 'awaiting_mandatory', data: {} };
+        pending.current = { username, platform, step: 'awaiting_mandatory', data: {}, prefilled };
+        const missing = [];
+        if (!prefilled.language) missing.push('Language: (e.g. Hindi)');
+        if (!prefilled.niche) missing.push('Niche: (e.g. Finance)');
+        if (!prefilled.gender) missing.push('Gender: (Male / Female / Other)');
+        const hint = missing.length === 3
+            ? `Or in one line: Hindi, Finance, Male`
+            : `_Only the missing one(s) above — the rest are already set._`;
         await sock.sendMessage(jid, {
-            text: `Before I finalize @${username}, I need 3 details:\n\nPlease reply with:\nLanguage: (e.g. Hindi)\nNiche: (e.g. Finance)\nGender: (e.g. Male)\n\nOr in one line: Hindi, Finance, Male`
+            text: `Before I finalize ${label}, I need ${missing.length === 1 ? 'this detail' : 'these details'}:\n\n${missing.join('\n')}\n\n${hint}\n\n_Type "quit" to cancel._`
         });
     } else {
-        // Skip mandatory, check if there's a next username in queue
-        const nextUsername = pending.queue.shift();
-        if (nextUsername) {
-            await processScrapeForUser(sock, jid, msg, nextUsername, pending);
+        const next = pending.queue.shift();
+        if (next) {
+            await processScrapeForUser(sock, jid, msg, next, pending);
         } else {
             pendingScrapes.delete(jid);
         }

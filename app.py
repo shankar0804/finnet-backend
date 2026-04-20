@@ -116,6 +116,13 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=port, debug=True)
     else:
         from waitress import serve
-        logger.info("🚀 Starting Waitress PRODUCTION server (8 threads) on port %s", port)
-        serve(app, host='0.0.0.0', port=port, threads=8)
+        # Tunable thread count — default 4 for small Render plans (≤0.5 CPU).
+        # Bump via env to 8 / 12 on Standard+ plans. More threads ≠ faster on
+        # low-CPU plans because of context-switch overhead.
+        try:
+            threads = max(2, int(os.environ.get('WAITRESS_THREADS', '4')))
+        except ValueError:
+            threads = 4
+        logger.info("🚀 Starting Waitress PRODUCTION server (%d threads) on port %s", threads, port)
+        serve(app, host='0.0.0.0', port=port, threads=threads)
 
