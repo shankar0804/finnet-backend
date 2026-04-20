@@ -75,6 +75,51 @@ def detect_platform(url: str) -> str:
     )
 
 
+def _canonical_ig_url(url: str) -> str:
+    """Strip query string + tracking params from an IG post URL.
+
+    Apify's instagram-reel-scraper silently returns nothing when it gets
+    URLs like `.../p/<shortcode>/?hl=en` or `.../reel/<shortcode>/?igsh=...`.
+    We rebuild the URL from just the shortcode so the actor never sees
+    anything it might reject.
+    """
+    if not url:
+        return url
+    m = _IG_POST_PATH_RE.search(url)
+    if not m:
+        return url.split("?")[0].rstrip("/")
+    kind, shortcode = m.group(1).lower(), m.group(2)
+    # reel / reels / p / tv — keep the original path type so the actor
+    # handles the right variant.
+    if kind in ("reel", "reels"):
+        path = "reel"
+    elif kind == "tv":
+        path = "tv"
+    else:
+        path = "p"
+    return f"https://www.instagram.com/{path}/{shortcode}/"
+
+
+def _canonical_yt_url(url: str) -> str:
+    """Reduce a YouTube URL to the bare video form the actor accepts."""
+    if not url:
+        return url
+    if m := _YT_SHORT_RE.search(url):
+        return f"https://www.youtube.com/shorts/{m.group(1)}"
+    if m := _YT_BE_RE.search(url):
+        return f"https://www.youtube.com/watch?v={m.group(1)}"
+    if m := _YT_WATCH_RE.search(url):
+        return f"https://www.youtube.com/watch?v={m.group(1)}"
+    return url.split("&")[0]
+
+
+def _canonical_li_url(url: str) -> str:
+    """Strip the tracking trail off a LinkedIn post URL."""
+    if not url:
+        return url
+    return url.split("?")[0].rstrip("/")
+
+
 # ═══════════════════════════════════════════════════════════
 # Normalization helpers
 # ═══════════════════════════════════════════════════════════
@@ -171,21 +216,37 @@ def _extract_ig_owner(item: dict) -> tuple:
 
 
 def _fetch_instagram(url: str) -> dict:
-    logger.info(f"[PostScrape] Instagram: {url}")
-    items = _run_apify_actor(
-        APIFY_IG_REEL_ACTOR,
-        {"directUrls": [url], "resultsLimit": 1},
-    )
-    if not items:
-        # The reel actor returns nothing for non-video posts (/p/ carousels, photos).
-        # Fall back to the general Instagram scraper which handles all post types.
-        logger.info("[PostScrape] Instagram reel actor empty — trying general IG scraper")
+    clean_url = _canonical_ig_url(url)
+    logger.info(f"[PostScrape] Instagram: {url} -> {clean_url}")
+    try:
         items = _run_apify_actor(
-            "apify/instagram-scraper",
-            {"directUrls": [url], "resultsLimit": 1, "addParentData": False},
+            APIFY_IG_REEL_ACTOR,
+            {"directUrls": [clean_url], "resultsLimit": 1},
         )
+    except Exception as e:
+        logger.warning(f"[PostScrape] IG reel actor failed for {clean_url}: {e}")
+        items = []
+
+    logger.info(f"[PostScrape] IG reel actor returned {len(items)} item(s)")
     if not items:
-        raise PostNotFoundError(f"Instagram scraper returned no data for {url}")
+        # The reel actor returns nothing for non-video posts (/p/ carousels, photos)
+        # and for URLs it considers malformed. Fall back to the general scraper.
+        logger.info("[PostScrape] Trying apify/instagram-scraper fallback")
+        try:
+            items = _run_apify_actor(
+                "apify/instagram-scraper",
+                {"directUrls": [clean_url], "resultsLimit": 1, "addParentData": False},
+            )
+        except Exception as e:
+            logger.warning(f"[PostScrape] IG fallback scraper failed: {e}")
+            items = []
+        logger.info(f"[PostScrape] IG fallback returned {len(items)} item(s)")
+
+    if not items:
+        raise PostNotFoundError(
+            f"Instagram scrapers returned no data for {clean_url} — "
+            f"post may be private, deleted, or the actor is down."
+        )
 
     item = items[0]
     owner, creator_name = _extract_ig_owner(item)
@@ -267,18 +328,19 @@ def _parse_yt_duration(raw) -> int:
 
 
 def _fetch_youtube(url: str) -> dict:
-    logger.info(f"[PostScrape] YouTube: {url}")
+    clean_url = _canonical_yt_url(url)
+    logger.info(f"[PostScrape] YouTube: {url} -> {clean_url}")
     items = _run_apify_actor(
         APIFY_YT_VIDEO_ACTOR,
         {
-            "startUrls": [{"url": url}],
+            "startUrls": [{"url": clean_url}],
             "maxResults": 1,
             "maxResultsShorts": 1,
             "maxResultStreams": 0,
         },
     )
     if not items:
-        raise PostNotFoundError(f"YouTube scraper returned no data for {url}")
+        raise PostNotFoundError(f"YouTube scraper returned no data for {clean_url}")
 
     item = items[0]
     about = item.get("aboutChannelInfo") or {}
@@ -393,17 +455,18 @@ def _fetch_linkedin(url: str) -> dict:
             "Set APIFY_LINKEDIN_POST_ACTOR in env (e.g. apimaestro/linkedin-post-scraper) "
             "to enable."
         )
-    logger.info(f"[PostScrape] LinkedIn: {url}")
+    clean_url = _canonical_li_url(url)
+    logger.info(f"[PostScrape] LinkedIn: {url} -> {clean_url}")
     # Different LinkedIn actors use different input keys — try the two common ones.
     try:
         items = _run_apify_actor(
             APIFY_LINKEDIN_POST_ACTOR,
-            {"postUrls": [url]},
+            {"postUrls": [clean_url]},
         )
     except Exception:
         items = _run_apify_actor(
             APIFY_LINKEDIN_POST_ACTOR,
-            {"urls": [url]},
+            {"urls": [clean_url]},
         )
     if not items:
         raise PostNotFoundError(f"LinkedIn scraper returned no data for {url}")
