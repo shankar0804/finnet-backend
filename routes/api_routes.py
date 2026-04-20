@@ -1656,6 +1656,7 @@ def create_entry(current_user=None):
     scraped = None
     ocr_result = None
     platform_hint = None
+    scrape_error = None  # Surfaced to the UI when nothing else rescues the entry.
 
     # 1. Scrape from link (if provided)
     if link:
@@ -1673,10 +1674,12 @@ def create_entry(current_user=None):
             scraped = fetch_post_data(link)
         except PostNotFoundError as e:
             logger.warning(f'[ENTRY] Post scrape returned nothing for {link}: {e}')
+            scrape_error = f'The scraper ran but got no data for this {platform_hint} post ({e}).'
         except UnsupportedPlatformError as e:
             return jsonify({'error': str(e)}), 400
         except Exception as e:
             logger.error(f'[ENTRY] Post scrape failed for {link}: {e}')
+            scrape_error = f'Scraper error for this {platform_hint} post: {e}'
             # Don't fail the whole request — OCR or creator_username may carry us.
         finally:
             _release_scrape_slot()
@@ -1715,12 +1718,18 @@ def create_entry(current_user=None):
         return jsonify(result.get('entry') or {'success': True}), 201
 
     if result.get('status') == 'skipped':
-        # 202 Accepted-but-not-stored; frontend renders the reason.
+        # 202 Accepted-but-not-stored; frontend renders the reason. If the
+        # scraper blew up silently, include that in the reason so the user
+        # knows why their link didn't enrich (instead of just "no username").
+        reason = result.get('reason') or ''
+        if scrape_error and 'username' in reason.lower():
+            reason = f'{scrape_error} {reason}'.strip()
         return jsonify({
             'skipped': True,
-            'reason': result.get('reason'),
+            'reason': reason,
             'missing_creator': result.get('missing_creator'),
             'platform': result.get('platform'),
+            'scrape_error': scrape_error,
         }), 202
 
     return jsonify({'error': result.get('reason', 'Unknown error')}), 500

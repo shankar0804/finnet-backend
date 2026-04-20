@@ -139,6 +139,37 @@ def _empty_result(platform: str, post_url: str) -> dict:
 # ═══════════════════════════════════════════════════════════
 
 
+def _extract_ig_owner(item: dict) -> tuple:
+    """Return (username, full_name) by scanning all known key variants."""
+    # Flat keys used by apify/instagram-reel-scraper + apify/instagram-scraper
+    owner = (
+        item.get("ownerUsername")
+        or item.get("username")
+        or item.get("owner_username")
+    )
+    full_name = (
+        item.get("ownerFullName")
+        or item.get("fullName")
+        or item.get("owner_full_name")
+    )
+    # Nested {"owner": {...}} shape
+    if not owner:
+        o = item.get("owner") or {}
+        owner = o.get("username") or o.get("userName") or o.get("handle")
+        full_name = full_name or o.get("full_name") or o.get("fullName") or o.get("name")
+    # Fallback: parse the post URL itself — IG embeds the username before /reel/ sometimes,
+    # and profile_url blobs are common.
+    if not owner:
+        for k in ("ownerProfileUrl", "profileUrl", "ownerUrl"):
+            v = item.get(k)
+            if isinstance(v, str):
+                m = re.search(r"instagram\.com/([A-Za-z0-9_.]+)/?", v)
+                if m:
+                    owner = m.group(1)
+                    break
+    return (owner or "").lstrip("@"), (full_name or "")
+
+
 def _fetch_instagram(url: str) -> dict:
     logger.info(f"[PostScrape] Instagram: {url}")
     items = _run_apify_actor(
@@ -146,20 +177,22 @@ def _fetch_instagram(url: str) -> dict:
         {"directUrls": [url], "resultsLimit": 1},
     )
     if not items:
+        # The reel actor returns nothing for non-video posts (/p/ carousels, photos).
+        # Fall back to the general Instagram scraper which handles all post types.
+        logger.info("[PostScrape] Instagram reel actor empty — trying general IG scraper")
+        items = _run_apify_actor(
+            "apify/instagram-scraper",
+            {"directUrls": [url], "resultsLimit": 1, "addParentData": False},
+        )
+    if not items:
         raise PostNotFoundError(f"Instagram scraper returned no data for {url}")
 
     item = items[0]
-    owner = (
-        item.get("ownerUsername")
-        or item.get("owner", {}).get("username")
-        or item.get("username")
-        or ""
-    )
-    creator_name = (
-        item.get("ownerFullName")
-        or item.get("owner", {}).get("full_name")
-        or ""
-    )
+    owner, creator_name = _extract_ig_owner(item)
+    if not owner:
+        logger.warning(
+            f"[PostScrape] IG item returned but no owner — keys were: {list(item.keys())[:15]}"
+        )
 
     views = _safe_int(item.get("videoViewCount") or item.get("videoPlayCount"))
     plays = _safe_int(item.get("videoPlayCount") or item.get("videoViewCount"))
@@ -191,7 +224,7 @@ def _fetch_instagram(url: str) -> dict:
     result = _empty_result("instagram", url)
     result.update(
         {
-            "username": (owner or "").lstrip("@"),
+            "username": owner,
             "creator_name": creator_name,
             "profile_link": f"https://instagram.com/{owner}" if owner else "",
             "followers": followers,
@@ -250,15 +283,40 @@ def _fetch_youtube(url: str) -> dict:
     item = items[0]
     about = item.get("aboutChannelInfo") or {}
 
+    # streamers/youtube-scraper often omits channelUsername for single-video
+    # input. Fall back to parsing it out of channelUrl / channelHandle / input.url.
     channel_handle = (
-        (about.get("channelUsername") or item.get("channelUsername") or "")
-        .lstrip("@")
+        about.get("channelUsername")
+        or item.get("channelUsername")
+        or about.get("channelHandle")
+        or item.get("channelHandle")
+        or ""
     )
+    if not channel_handle:
+        for ref in (
+            about.get("channelUrl"),
+            item.get("channelUrl"),
+            about.get("channelProfileUrl"),
+            item.get("channelProfileUrl"),
+        ):
+            if not isinstance(ref, str):
+                continue
+            m = re.search(r"youtube\.com/@([A-Za-z0-9_.\-]+)", ref)
+            if m:
+                channel_handle = m.group(1)
+                break
+    channel_handle = channel_handle.lstrip("@")
+
     channel_name = about.get("channelName") or item.get("channelName") or ""
     channel_id = about.get("channelId") or item.get("channelId") or ""
     subscribers = _safe_int(
         about.get("numberOfSubscribers") or item.get("numberOfSubscribers")
     )
+
+    if not channel_handle and not channel_id:
+        logger.warning(
+            f"[PostScrape] YT item missing channel id+handle — keys were: {list(item.keys())[:15]}"
+        )
 
     views = _safe_int(item.get("viewCount"))
     likes = _safe_int(item.get("likes"))
@@ -275,6 +333,9 @@ def _fetch_youtube(url: str) -> dict:
         deliverable = "Short"
 
     result = _empty_result("youtube", url)
+    # Prefer the readable handle as username; only fall back to the raw
+    # channel_id (UCxxx…) so downstream creator resolution still works even
+    # when the actor didn't expose a handle.
     result.update(
         {
             "username": channel_handle or channel_id,

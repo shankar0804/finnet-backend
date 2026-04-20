@@ -134,10 +134,17 @@ def _lookup_creator(platform: str, username: str, channel_id: str = "") -> Optio
 
 
 def _auto_stub_creator(platform: str, scraped: dict) -> Optional[dict]:
-    """Create a minimal creator row when we have enough scraped data.
+    """Create a creator row when the post scrape surfaced a new creator.
 
-    Required for auto-stub: username (or channel_id for YT) + a follower
-    or subscriber count. Returns the inserted row or None if insufficient.
+    For Instagram / YouTube we run the FULL creator-level scraper so the
+    row ends up with proper followers/subs, avg views, engagement rate,
+    avg video length, etc. — not just the one-post slice. If the full
+    scrape fails (insufficient public data / actor error) we fall back
+    to a minimal stub from the post-level data.
+
+    Required for the fallback stub: username (or channel_id for YT) +
+    a follower/subscriber count. Returns the inserted row or None if
+    we genuinely don't have enough to seed a row.
     """
     username = (scraped.get("username") or "").lstrip("@").strip()
     followers = int(scraped.get("followers") or 0)
@@ -146,7 +153,27 @@ def _auto_stub_creator(platform: str, scraped: dict) -> Optional[dict]:
 
     try:
         if platform == "instagram":
-            if not username or followers <= 0:
+            if not username:
+                return None
+            # Run the real profile+reel scraper so the new row gets filled
+            # with avg_views / engagement_rate / avg_video_length etc.
+            try:
+                from services.scraper_service import (
+                    fetch_influencer_data,
+                    InsufficientDataError,
+                )
+                full = fetch_influencer_data(username)
+                full["platform"] = full.get("platform") or "Instagram"
+                r = supabase.table("influencers").insert(full).execute()
+                logger.info(f"[ENTRY] Auto-stubbed IG @{username} via full profile scrape")
+                return r.data[0] if r.data else full
+            except InsufficientDataError as e:
+                logger.warning(f"[ENTRY] IG full-scrape insufficient for @{username}: {e}")
+            except Exception as e:
+                logger.warning(f"[ENTRY] IG full-scrape errored for @{username}: {e}")
+
+            # Minimal fallback stub
+            if followers <= 0:
                 return None
             row = {
                 "username": username,
@@ -163,7 +190,28 @@ def _auto_stub_creator(platform: str, scraped: dict) -> Optional[dict]:
             return r.data[0] if r.data else row
 
         if platform == "youtube":
-            if (not username and not channel_id) or followers <= 0:
+            if not username and not channel_id:
+                return None
+            # Run the full YouTube channel scraper (long-form + shorts) so
+            # we get subs, total_videos, avg long/short views, ER, etc.
+            try:
+                from services.youtube_scraper_service import fetch_youtube_data
+                from services.scraper_service import InsufficientDataError
+                lookup = username or channel_id
+                full = fetch_youtube_data(lookup)
+                r = supabase.table("youtube_creators").insert(full).execute()
+                logger.info(
+                    f"[ENTRY] Auto-stubbed YT {full.get('channel_handle') or full.get('channel_id')} "
+                    f"via full channel scrape"
+                )
+                return r.data[0] if r.data else full
+            except InsufficientDataError as e:
+                logger.warning(f"[ENTRY] YT full-scrape insufficient for {username or channel_id}: {e}")
+            except Exception as e:
+                logger.warning(f"[ENTRY] YT full-scrape errored for {username or channel_id}: {e}")
+
+            # Minimal fallback stub
+            if followers <= 0:
                 return None
             row = {
                 "channel_id": channel_id or username,
@@ -178,7 +226,7 @@ def _auto_stub_creator(platform: str, scraped: dict) -> Optional[dict]:
 
         if platform == "linkedin":
             # LinkedIn posts rarely expose follower count on the post object —
-            # the rule allows auto-stub when we at least have username.
+            # the rule allows auto-stub when we at least have a username.
             if not username:
                 return None
             row = {
