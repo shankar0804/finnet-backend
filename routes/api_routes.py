@@ -1484,12 +1484,14 @@ def get_brand_by_hash(brand_hash, current_user=None):
 
         # Fetch campaigns for this brand
         camps = supabase.table('campaigns').select('*').eq('partnership_id', brand['id']).order('created_at', desc=True).execute()
-        brand['campaigns'] = camps.data
+        brand['campaigns'] = camps.data or []
 
-        # Fetch entries for each campaign
+        # Fetch + enrich entries for each campaign so the brand portal gets
+        # the same creator_name / followers / demographics / aliases as the
+        # internal list_entries endpoint.
         for c in brand['campaigns']:
-            entries = supabase.table('campaign_entries').select('*').eq('campaign_id', c['id']).execute()
-            c['entries'] = entries.data
+            entries = supabase.table('campaign_entries').select('*').eq('campaign_id', c['id']).order('created_at', desc=True).execute()
+            c['entries'] = _enrich_entries(entries.data or [])
 
         return jsonify(brand)
     except Exception as e:
@@ -1571,136 +1573,138 @@ def delete_campaign(cid, current_user=None):
 
 # ─── Campaign Entries ───
 
+# ═══════════════════════════════════════════════════════════
+# Shared entry-enrichment helper
+# ═══════════════════════════════════════════════════════════
+# Used by both the internal brand-management flow (list_entries) and the
+# external brand-portal flow (get_brand_by_hash) so both surfaces render
+# with the same demographics / creator-name / avg-views enrichment.
+
+_DEMO_COLS = (
+    "age_13_17", "age_18_24", "age_25_34", "age_35_44", "age_45_54",
+    "male_pct", "female_pct",
+    "city_1", "city_2", "city_3", "city_4", "city_5",
+)
+
+
+def _pack_demographics(row: dict) -> dict:
+    if not row:
+        return {}
+    cities = [row.get(f"city_{i}") for i in range(1, 6)]
+    cities = [c for c in cities if c]
+    return {
+        "age_13_17": row.get("age_13_17", ""),
+        "age_18_24": row.get("age_18_24", ""),
+        "age_25_34": row.get("age_25_34", ""),
+        "age_35_44": row.get("age_35_44", ""),
+        "age_45_54": row.get("age_45_54", ""),
+        "male": row.get("male_pct", ""),
+        "female": row.get("female_pct", ""),
+        "cities": cities,
+    }
+
+
+def _enrich_entries(entries: list) -> list:
+    """Join campaign entries with their per-platform creator info.
+
+    Batch-fetches influencers / youtube_creators / linkedin_creators so the
+    UI can show creator_name, followers/subscribers, profile_link,
+    avg_views_est, demographics, and aliases deliverable/commercials/
+    live_link/timestamp. Safe on an empty list. Mutates `entries` in place
+    and returns it for convenience."""
+    if not entries:
+        return entries
+
+    ig_users = {e['creator_username'] for e in entries if (e.get('platform') or 'instagram') == 'instagram' and e.get('creator_username')}
+    yt_users = {e['creator_username'] for e in entries if e.get('platform') == 'youtube' and e.get('creator_username')}
+    li_users = {e['creator_username'] for e in entries if e.get('platform') == 'linkedin' and e.get('creator_username')}
+
+    ig_map, yt_map, li_map = {}, {}, {}
+
+    if ig_users:
+        try:
+            ig_cols = "username,creator_name,followers,profile_link,avg_views," + ",".join(_DEMO_COLS)
+            ig_resp = supabase.table('influencers').select(ig_cols).in_('username', list(ig_users)).execute()
+            ig_map = {r['username']: r for r in (ig_resp.data or [])}
+        except Exception as lookup_err:
+            logger.warning(f"[enrich_entries] IG enrichment failed: {lookup_err}")
+
+    if yt_users:
+        try:
+            yt_cols = "channel_handle,channel_id,channel_name,subscribers,profile_link,avg_long_views,avg_short_views," + ",".join(_DEMO_COLS)
+            yt_resp = supabase.table('youtube_creators').select(yt_cols).in_('channel_handle', list(yt_users)).execute()
+            for r in (yt_resp.data or []):
+                if r.get('channel_handle'):
+                    yt_map[r['channel_handle']] = r
+            missing = [u for u in yt_users if u not in yt_map]
+            if missing:
+                yt_resp2 = supabase.table('youtube_creators').select(yt_cols).in_('channel_id', missing).execute()
+                for r in (yt_resp2.data or []):
+                    if r.get('channel_id'):
+                        yt_map[r['channel_id']] = r
+        except Exception as lookup_err:
+            logger.warning(f"[enrich_entries] YT enrichment failed: {lookup_err}")
+
+    if li_users:
+        try:
+            li_resp = supabase.table('linkedin_creators').select(
+                "profile_id,full_name,connections,profile_link,headline"
+            ).in_('profile_id', list(li_users)).execute()
+            li_map = {r['profile_id']: r for r in (li_resp.data or [])}
+        except Exception as lookup_err:
+            logger.warning(f"[enrich_entries] LI enrichment failed: {lookup_err}")
+
+    for e in entries:
+        platform = (e.get('platform') or 'instagram').lower()
+        u = e.get('creator_username') or ''
+        e['username'] = u
+        e['deliverable'] = e.get('deliverable_type') or ''
+        e['commercials'] = e.get('amount') or 0
+        e['live_link'] = e.get('content_link') or ''
+        e['timestamp'] = e.get('post_timestamp') or e.get('created_at')
+
+        creator = None
+        if platform == 'instagram':
+            creator = ig_map.get(u)
+            if creator:
+                e['creator_name'] = creator.get('creator_name') or ''
+                e['followers'] = creator.get('followers') or 0
+                e['profile_link'] = creator.get('profile_link') or ''
+                e['avg_views_est'] = creator.get('avg_views') or 0
+                e['demographics'] = _pack_demographics(creator)
+        elif platform == 'youtube':
+            creator = yt_map.get(u)
+            if creator:
+                e['creator_name'] = creator.get('channel_name') or ''
+                e['subscribers'] = creator.get('subscribers') or 0
+                e['followers'] = creator.get('subscribers') or 0
+                e['profile_link'] = creator.get('profile_link') or ''
+                e['avg_views_est'] = creator.get('avg_long_views') or creator.get('avg_short_views') or 0
+                e['demographics'] = _pack_demographics(creator)
+        elif platform == 'linkedin':
+            creator = li_map.get(u)
+            if creator:
+                e['creator_name'] = creator.get('full_name') or ''
+                e['followers'] = creator.get('connections') or 0
+                e['profile_link'] = creator.get('profile_link') or ''
+                e['headline'] = creator.get('headline') or ''
+
+        e.setdefault('creator_name', '')
+        e.setdefault('followers', 0)
+        e.setdefault('profile_link', '')
+        e.setdefault('avg_views_est', 0)
+        e.setdefault('demographics', {})
+
+    return entries
+
+
 @api_bp.route('/campaigns/<cid>/entries', methods=['GET'])
 @require_auth
 def list_entries(cid, current_user=None):
-    """List all entries for a campaign, enriched with per-platform creator info.
-
-    For each entry we join the matching creator table so the UI can show
-    `creator_name`, `followers/subscribers`, `profile_link`, `avg_views_est`,
-    and a compact `demographics` sub-object (age buckets, gender split, top
-    5 cities). `deliverable` and `commercials` aliases are also added so
-    the existing EntryTables renderer works without per-platform branches.
-    """
-    # Demographic columns that exist on influencers + youtube_creators.
-    _DEMO_COLS = (
-        "age_13_17", "age_18_24", "age_25_34", "age_35_44", "age_45_54",
-        "male_pct", "female_pct",
-        "city_1", "city_2", "city_3", "city_4", "city_5",
-    )
-
-    def _pack_demographics(row: dict) -> dict:
-        if not row:
-            return {}
-        cities = [row.get(f"city_{i}") for i in range(1, 6)]
-        cities = [c for c in cities if c]
-        return {
-            "age_13_17": row.get("age_13_17", ""),
-            "age_18_24": row.get("age_18_24", ""),
-            "age_25_34": row.get("age_25_34", ""),
-            "age_35_44": row.get("age_35_44", ""),
-            "age_45_54": row.get("age_45_54", ""),
-            "male": row.get("male_pct", ""),
-            "female": row.get("female_pct", ""),
-            "cities": cities,
-        }
-
+    """List all entries for a campaign, enriched with per-platform creator info."""
     try:
         resp = supabase.table('campaign_entries').select('*').eq('campaign_id', cid).order('created_at', desc=True).execute()
-        entries = resp.data or []
-
-        # Batch-fetch creators per platform to avoid N+1 round-trips.
-        ig_users = {e['creator_username'] for e in entries if (e.get('platform') or 'instagram') == 'instagram' and e.get('creator_username')}
-        yt_users = {e['creator_username'] for e in entries if e.get('platform') == 'youtube' and e.get('creator_username')}
-        li_users = {e['creator_username'] for e in entries if e.get('platform') == 'linkedin' and e.get('creator_username')}
-
-        ig_map, yt_map, li_map = {}, {}, {}
-
-        if ig_users:
-            try:
-                ig_cols = "username,creator_name,followers,profile_link,avg_views," + ",".join(_DEMO_COLS)
-                ig_resp = supabase.table('influencers').select(ig_cols).in_('username', list(ig_users)).execute()
-                ig_map = {r['username']: r for r in (ig_resp.data or [])}
-            except Exception as lookup_err:
-                logger.warning(f"[list_entries] IG enrichment failed: {lookup_err}")
-
-        if yt_users:
-            try:
-                yt_cols = "channel_handle,channel_id,channel_name,subscribers,profile_link,avg_long_views,avg_short_views," + ",".join(_DEMO_COLS)
-                yt_resp = supabase.table('youtube_creators').select(yt_cols).in_('channel_handle', list(yt_users)).execute()
-                for r in (yt_resp.data or []):
-                    if r.get('channel_handle'):
-                        yt_map[r['channel_handle']] = r
-                # Second pass: any entries whose creator_username is actually a raw
-                # channel_id (UC…) get looked up separately.
-                missing = [u for u in yt_users if u not in yt_map]
-                if missing:
-                    yt_resp2 = supabase.table('youtube_creators').select(yt_cols).in_('channel_id', missing).execute()
-                    for r in (yt_resp2.data or []):
-                        if r.get('channel_id'):
-                            yt_map[r['channel_id']] = r
-            except Exception as lookup_err:
-                logger.warning(f"[list_entries] YT enrichment failed: {lookup_err}")
-
-        if li_users:
-            try:
-                li_resp = supabase.table('linkedin_creators').select(
-                    "profile_id,full_name,connections,profile_link,headline"
-                ).in_('profile_id', list(li_users)).execute()
-                li_map = {r['profile_id']: r for r in (li_resp.data or [])}
-            except Exception as lookup_err:
-                logger.warning(f"[list_entries] LI enrichment failed: {lookup_err}")
-
-        for e in entries:
-            platform = (e.get('platform') or 'instagram').lower()
-            u = e.get('creator_username') or ''
-            # Always surface creator_username under `username` too — the
-            # existing EntryTables renderer reads `e.username`.
-            e['username'] = u
-
-            # Alias booking columns to what the UI table renders.
-            e['deliverable'] = e.get('deliverable_type') or ''
-            e['commercials'] = e.get('amount') or 0
-            e['live_link'] = e.get('content_link') or ''
-            e['timestamp'] = e.get('post_timestamp') or e.get('created_at')
-
-            creator = None
-            if platform == 'instagram':
-                creator = ig_map.get(u)
-                if creator:
-                    e['creator_name'] = creator.get('creator_name') or ''
-                    e['followers'] = creator.get('followers') or 0
-                    e['profile_link'] = creator.get('profile_link') or ''
-                    e['avg_views_est'] = creator.get('avg_views') or 0
-                    e['demographics'] = _pack_demographics(creator)
-            elif platform == 'youtube':
-                creator = yt_map.get(u)
-                if creator:
-                    e['creator_name'] = creator.get('channel_name') or ''
-                    e['subscribers'] = creator.get('subscribers') or 0
-                    e['followers'] = creator.get('subscribers') or 0
-                    e['profile_link'] = creator.get('profile_link') or ''
-                    # Prefer long-form average for "avg views (est)" — fall
-                    # back to shorts when the channel is shorts-only.
-                    e['avg_views_est'] = creator.get('avg_long_views') or creator.get('avg_short_views') or 0
-                    e['demographics'] = _pack_demographics(creator)
-            elif platform == 'linkedin':
-                creator = li_map.get(u)
-                if creator:
-                    e['creator_name'] = creator.get('full_name') or ''
-                    e['followers'] = creator.get('connections') or 0
-                    e['profile_link'] = creator.get('profile_link') or ''
-                    e['headline'] = creator.get('headline') or ''
-
-            # Make sure these always exist (even when the creator lookup missed)
-            # so the React renderer has consistent keys.
-            e.setdefault('creator_name', '')
-            e.setdefault('followers', 0)
-            e.setdefault('profile_link', '')
-            e.setdefault('avg_views_est', 0)
-            e.setdefault('demographics', {})
-
-        return jsonify(entries)
+        return jsonify(_enrich_entries(resp.data or []))
     except Exception as e:
         logger.error(f"[list_entries] failed: {e}")
         return jsonify({'error': str(e)}), 500
