@@ -160,8 +160,14 @@ YT_KEYWORDS = {
     'watch time', 'ctr',
 }
 LI_KEYWORDS = {
-    'linkedin', 'li', 'connection', 'connections', 'company', 'companies',
-    'headline', 'professional', 'employee', 'industry',
+    'linkedin', 'li',
+    'connection', 'connections',
+    'company', 'companies',
+    'headline', 'headlines',
+    'professional', 'professionals',
+    'employee', 'employees',
+    'industry', 'industries',
+    'ceo', 'founder', 'founders', 'vp', 'cto', 'manager', 'managers', 'director', 'directors',
 }
 
 
@@ -202,25 +208,55 @@ _WORD_COUNTS = {
 
 
 def _extract_limit_from_query(q: str):
-    """Return an integer N if the user asked for 'N creators / give me N / top N / first N', else None."""
+    """Return an integer N if the user asked for 'N creators / give me N / top N / first N', else None.
+
+    Handles phrasings like:
+      - "top 3 / first 5 / only 10 / latest 20"
+      - "give me 3", "show us 5", "list me 10"
+      - "give me a list of 10", "show me a set of 20"
+      - "10 creators", "10 finance creators", "10 top beauty influencers"
+      - "give me three creators" (number-words one..ten)
+    """
     if not q:
         return None
     ql = q.lower()
-    # "top 3" / "first 5" / "only 10"
+
+    # "top 3" / "first 5" / "only 10" / "latest 20"
     m = re.search(r'\b(?:top|first|only|last|latest)\s+(\d{1,4})\b', ql)
     if m:
         return int(m.group(1))
-    # "give/show/find/list me 3" or "3 creators/channels/profiles"
-    m = re.search(r'\b(?:give|show|list|find|fetch|get)\s+(?:me|us)?\s*(\d{1,4})\b', ql)
+
+    # "give/show/find/list/get me [a list/set/batch of] 3"
+    m = re.search(
+        r'\b(?:give|show|list|find|fetch|get)\s+'
+        r'(?:me\s+|us\s+)?'
+        r'(?:a\s+(?:list|set|batch|bunch|couple|few|handful)\s+(?:of\s+)?)?'
+        r'(\d{1,4})\b',
+        ql,
+    )
     if m:
         return int(m.group(1))
-    m = re.search(r'\b(\d{1,4})\s+(?:creator|creators|channel|channels|profile|profiles|influencer|influencers|result|results|row|rows)\b', ql)
+
+    # "10 creators", "10 finance creators", "10 top beauty influencers"
+    # Up to 3 adjective words allowed between the number and the noun.
+    m = re.search(
+        r'\b(\d{1,4})\s+(?:[a-z][a-z\-]{1,20}\s+){0,3}'
+        r'(?:creator|creators|channel|channels|profile|profiles|'
+        r'influencer|influencers|result|results|row|rows|account|accounts|page|pages)\b',
+        ql,
+    )
     if m:
         n = int(m.group(1))
         if n <= 500:
             return n
-    # "give me three creators"
-    m = re.search(r'\b(?:top|first|only|give|show|list)\s+(one|two|three|four|five|six|seven|eight|nine|ten)\b', ql)
+
+    # "give me three creators" (number-words)
+    m = re.search(
+        r'\b(?:top|first|only|give|show|list)\s+(?:me\s+|us\s+)?'
+        r'(?:a\s+(?:list|set|batch)\s+(?:of\s+)?)?'
+        r'(one|two|three|four|five|six|seven|eight|nine|ten)\b',
+        ql,
+    )
     if m:
         return _WORD_COUNTS.get(m.group(1))
     return None
@@ -336,7 +372,7 @@ There are THREE tables. Choose the correct one based on the user's question:
 9. **Number shorthand (CRITICAL)**:
    - "500k" / "500K" means 500000. "1.2m" / "1.2M" means 1200000. "10b" means 10000000000.
    - ALWAYS expand these in the SQL — never write `followers > 500`, write `followers > 500000`.
-10. **Count phrases (CRITICAL)**: If the user says "give me N", "show me N", "top N", "first N", "only N", or any variant specifying a count of creators, ALWAYS add `LIMIT N` to the query.
+10. **Count phrases (CRITICAL)**: If the user says "give me N", "show me N", "top N", "first N", "only N", or any variant specifying a count of creators, ALWAYS add `LIMIT N` to the query. This includes phrases with words in between like "give me a list of N" or "show me the top N".
 11. **Threshold phrasing**:
     - "above X" / "over X" / "more than X" → `column > X`
     - "below X" / "under X" / "less than X" → `column < X`
@@ -344,7 +380,19 @@ There are THREE tables. Choose the correct one based on the user's question:
     - "between X and Y" → `column BETWEEN X AND Y`
 12. When the user mentions a count AND a threshold (e.g. "3 creators above 500k"), ALWAYS add both `WHERE column > <threshold>` and `ORDER BY column DESC LIMIT <count>`.
 13. **Default ordering**: when the query is about "top", "best", "biggest", or any size word, ORDER BY the primary metric DESC (followers / subscribers / connections).
-14. Output ONLY the raw SQL. Nothing else.
+14. **Engagement rate scale (CRITICAL)**: `engagement_rate`, `long_engagement_rate`, and `short_engagement_rate` are stored as **percentage-numbers** (e.g. `7.5` means 7.5%, `0.8` means 0.8%). So:
+    - "engagement rate over 5%" / "ER > 5%" / "above 5% engagement" → `engagement_rate > 5` (NEVER `> 0.05`).
+    - "at least 2%" → `engagement_rate >= 2`.
+    - Ignore the `%` sign — use the number as-is.
+15. **City columns vs location (CRITICAL)**:
+    - `location` = the creator's OWN home city (where the creator lives).
+    - `city_1`, `city_2`, `city_3`, `city_4`, `city_5` = top 5 cities of the creator's AUDIENCE (audience demographics, ordered by share).
+    - Phrases like "audience in Delhi", "fans from Mumbai", "viewers in Bangalore", "Delhi audience", **"delhi as city 1"**, "city 1 is delhi", or "top audience city = X" refer to the city_* columns, NOT `location`.
+    - "Delhi as city 1" specifically means **`LOWER(city_1) LIKE LOWER('%delhi%')`**.
+    - "audience in delhi" (without specifying rank) means the city appears in ANY of city_1..city_5:
+      `(LOWER(city_1) LIKE '%delhi%' OR LOWER(city_2) LIKE '%delhi%' OR LOWER(city_3) LIKE '%delhi%' OR LOWER(city_4) LIKE '%delhi%' OR LOWER(city_5) LIKE '%delhi%')`.
+    - Phrases like "creators from Delhi", "Delhi-based creator", "located in Mumbai" refer to `location`.
+16. Output ONLY the raw SQL. Nothing else.
 
 **Examples (follow these PATTERNS exactly):**
 
@@ -380,6 +428,18 @@ SELECT creator_name, username, profile_link, niche, followers, avg_views FROM in
 
 User: "Platform: instagram. beauty creators in mumbai"
 SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE LOWER(niche) LIKE LOWER('%beauty%') AND LOWER(location) LIKE LOWER('%mumbai%')
+
+User: "Platform: instagram. 10 finance creators with over 5% engagement rate and delhi as city 1"
+SELECT creator_name, username, profile_link, niche, followers, avg_views, engagement_rate, city_1 FROM influencers WHERE LOWER(niche) LIKE LOWER('%finance%') AND engagement_rate IS NOT NULL AND engagement_rate > 5 AND LOWER(city_1) LIKE LOWER('%delhi%') ORDER BY engagement_rate DESC LIMIT 10
+
+User: "Platform: instagram. give me a list of 10 finance creators with over 5% engagement rate"
+SELECT creator_name, username, profile_link, niche, followers, avg_views, engagement_rate FROM influencers WHERE LOWER(niche) LIKE LOWER('%finance%') AND engagement_rate IS NOT NULL AND engagement_rate > 5 ORDER BY engagement_rate DESC LIMIT 10
+
+User: "Platform: instagram. creators whose audience is mostly from mumbai"
+SELECT creator_name, username, profile_link, niche, followers, city_1, city_2, city_3 FROM influencers WHERE LOWER(city_1) LIKE LOWER('%mumbai%') OR LOWER(city_2) LIKE LOWER('%mumbai%') OR LOWER(city_3) LIKE LOWER('%mumbai%') OR LOWER(city_4) LIKE LOWER('%mumbai%') OR LOWER(city_5) LIKE LOWER('%mumbai%')
+
+User: "Platform: youtube. top 5 youtube channels with long engagement above 3%"
+SELECT channel_name, channel_handle, profile_link, niche, subscribers, avg_long_views, long_engagement_rate FROM youtube_creators WHERE long_engagement_rate IS NOT NULL AND long_engagement_rate > 3 ORDER BY long_engagement_rate DESC LIMIT 5
 
 User: "Platform: instagram. creators whose niche is blank"
 SELECT creator_name, username, profile_link, niche, followers, avg_views FROM influencers WHERE niche IS NULL OR TRIM(niche) = ''

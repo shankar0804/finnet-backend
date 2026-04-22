@@ -107,6 +107,9 @@ async function resetChatState(jid, sock, quoted) {
         hadState = true;
     }
 
+    // 5) Clear screenshot-hint memo so we re-explain next time if needed
+    screenshotHintSent.delete(jid);
+
     if (sock) {
         const text = hadState
             ? '🛑 Cancelled — previous session cleared. Ask me anything to start fresh.'
@@ -225,6 +228,10 @@ function addToHistory(jid, msg) {
 // ─── Pending Scrape State Machine ───
 // Tracks per-chat scrape flows that need mandatory field input
 const pendingScrapes = new Map();
+
+// Per-chat memo: have we already told this user how screenshots work?
+// Reset when they run /quit or finish a scrape flow.
+const screenshotHintSent = new Set();
 
 // Track bulk import jobs: job_id -> { jid, msgKey }
 const bulkImportJobs = new Map();
@@ -359,7 +366,10 @@ async function callScraper(target) {
 
 /**
  * Download a WhatsApp image and send it to the Trakr OCR API.
+ * Hard timeout prevents a stuck OCR call from freezing the per-JID queue.
  */
+const OCR_TIMEOUT_MS = parseInt(process.env.OCR_TIMEOUT_MS || '60000', 10);
+
 async function processImage(msg, targetUsername) {
     try {
         console.log(`📸 [OCR] Downloading image for @${targetUsername}...`);
@@ -377,37 +387,50 @@ async function processImage(msg, targetUsername) {
         });
         form.append('target_username', targetUsername);
 
-        return new Promise((resolve) => {
+        return await new Promise((resolve) => {
+            let settled = false;
+            const finish = (val) => { if (!settled) { settled = true; resolve(val); } };
+
+            const timeout = setTimeout(() => {
+                console.error(`📸 [OCR] Timeout after ${OCR_TIMEOUT_MS}ms`);
+                try { req?.destroy?.(); } catch (_) {}
+                finish({ success: false, error: `OCR timed out after ${Math.round(OCR_TIMEOUT_MS / 1000)}s` });
+            }, OCR_TIMEOUT_MS);
+
             const req = form.submit(`${TRAKR_API_URL}/api/upload`, (err, res) => {
                 if (err) {
+                    clearTimeout(timeout);
                     console.error(`📸 [OCR] Upload error: ${err.message}`);
-                    resolve({ success: false, error: `Upload failed: ${err.message}` });
+                    finish({ success: false, error: `Upload failed: ${err.message}` });
                     return;
                 }
                 let body = '';
                 res.on('data', (chunk) => body += chunk);
                 res.on('end', () => {
+                    clearTimeout(timeout);
                     console.log(`📸 [OCR] Server responded: ${res.statusCode} (${body.length} bytes)`);
                     try {
                         const data = JSON.parse(body);
                         if (res.statusCode >= 200 && res.statusCode < 300) {
-                            resolve({ success: true, result: data.result });
+                            finish({ success: true, result: data.result });
                         } else {
-                            resolve({ success: false, error: data.error || `OCR failed (HTTP ${res.statusCode})` });
+                            finish({ success: false, error: data.error || `OCR failed (HTTP ${res.statusCode})` });
                         }
                     } catch (e) {
                         console.error(`📸 [OCR] Invalid server response: ${body.slice(0, 200)}`);
-                        resolve({ success: false, error: 'Invalid server response' });
+                        finish({ success: false, error: 'Invalid server response' });
                     }
                 });
                 res.on('error', (e) => {
+                    clearTimeout(timeout);
                     console.error(`📸 [OCR] Response error: ${e.message}`);
-                    resolve({ success: false, error: `Response error: ${e.message}` });
+                    finish({ success: false, error: `Response error: ${e.message}` });
                 });
             });
             req.on('error', (e) => {
+                clearTimeout(timeout);
                 console.error(`📸 [OCR] Request error: ${e.message}`);
-                resolve({ success: false, error: `Request failed: ${e.message}` });
+                finish({ success: false, error: `Request failed: ${e.message}` });
             });
         });
     } catch (err) {
@@ -555,7 +578,13 @@ function formatReply(data) {
     return msg.trim();
 }
 
+// Hard timeout for the custom-search endpoint — prevents a slow LLM or DB
+// query from stalling the per-JID message queue indefinitely.
+const QUERY_TIMEOUT_MS = parseInt(process.env.QUERY_TIMEOUT_MS || '45000', 10);
+
 async function queryTrakr(query, platform = null) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), QUERY_TIMEOUT_MS);
     try {
         const body = { query };
         if (platform) body.platform = platform;
@@ -563,6 +592,7 @@ async function queryTrakr(query, platform = null) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),
+            signal: controller.signal,
         });
         if (!res.ok) {
             const err = await res.json().catch(() => ({}));
@@ -571,7 +601,12 @@ async function queryTrakr(query, platform = null) {
         const data = await res.json();
         return data.answer || { type: 'error', message: 'No answer' };
     } catch (err) {
+        if (err.name === 'AbortError') {
+            return { type: 'error', message: `Search timed out after ${Math.round(QUERY_TIMEOUT_MS / 1000)}s — try again or narrow the query.` };
+        }
         return { type: 'error', message: `Server unreachable: ${err.message}` };
+    } finally {
+        clearTimeout(timer);
     }
 }
 
@@ -765,32 +800,61 @@ async function startBot() {
                 }
 
                 // ─── HANDLE SCREENSHOTS DURING PENDING SCRAPE ───
-                // If we're awaiting screenshots and user sends an image, process it immediately
+                // If we're awaiting screenshots and user sends an image, process it immediately.
+                // IMPORTANT: give the user IMMEDIATE visual feedback (reaction) before the
+                // slow OCR round-trip, otherwise the bot looks dead for 10-30s.
                 if (hasImage && pendingScrapes.has(jid)) {
                     const pending = pendingScrapes.get(jid);
                     if (pending.current && pending.current.step === 'awaiting_screenshots') {
                         const username = pending.current.username;
                         console.log(`📸 [PENDING] Screenshot received for @${username}, processing...`);
-                        
+
+                        // Immediate acknowledgement so the user knows we got the image.
+                        try { await sock.sendMessage(jid, { react: { text: '📸', key: msg.key } }); } catch (_) {}
+
                         // Get the actual image message (could be in ephemeral wrapper)
-                        const imgMsg = msg.message?.imageMessage 
-                            ? msg 
+                        const imgMsg = msg.message?.imageMessage
+                            ? msg
                             : { ...msg, message: { imageMessage: msg.message?.ephemeralMessage?.message?.imageMessage } };
-                        
-                        const result = await processImage(imgMsg, username);
+
+                        let result;
+                        try {
+                            result = await processImage(imgMsg, username);
+                        } catch (e) {
+                            console.error(`📸 [OCR] Unhandled error: ${e?.message || e}`);
+                            result = { success: false, error: e?.message || 'unknown error' };
+                        }
+
+                        // Clear the thinking reaction
+                        try { await sock.sendMessage(jid, { react: { text: '', key: msg.key } }); } catch (_) {}
+
                         if (result.success) {
                             await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.success)} Screenshot processed for *@${username}*! Send more screenshots or type "done" to finish.` }, { quoted: msg });
                         } else {
                             console.error(`  OCR failed: ${result.error}`);
-                            await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} Couldn't read that screenshot. Try a clearer one, or type "done" to move on.` }, { quoted: msg });
+                            await sock.sendMessage(jid, { text: `${randomFrom(REACTIONS.fail)} Couldn't read that screenshot (_${result.error || 'unknown error'}_). Try a clearer one, or type "done" to move on.` }, { quoted: msg });
                         }
                         continue;
                     }
                 }
 
-                // Store images even without text (for screenshot collection)
+                // Store images even without text (for screenshot collection).
+                // React so the user knows the screenshot was received — it was previously
+                // swallowed silently, which made the bot look broken.
                 if (!text && hasImage) {
-                    console.log(`📸 [DEBUG] Image without text — storing in history and skipping reply.`);
+                    console.log(`📸 [DEBUG] Image without text — storing in history.`);
+                    try { await sock.sendMessage(jid, { react: { text: '📸', key: msg.key } }); } catch (_) {}
+
+                    // One-time hint the first time they drop a screenshot into an idle chat,
+                    // so they know HOW to actually use it. Gated per-chat via a memo set.
+                    if (!screenshotHintSent.has(jid)) {
+                        screenshotHintSent.add(jid);
+                        try {
+                            await sock.sendMessage(jid, {
+                                text: `📸 _Got your screenshot — saved for the next scrape._\n\nDrop the creator link after your screenshots, e.g.\n*add https://instagram.com/<handle>*\nand I'll OCR them automatically.`
+                            }, { quoted: msg });
+                        } catch (_) {}
+                    }
                     continue;
                 }
                 
@@ -1318,7 +1382,15 @@ async function startBot() {
                 // ═══════════════════════════════════════════
                 // ACTION: SEARCH (default)
                 // ═══════════════════════════════════════════
-                const searchQuery = intent.query || query;
+                // The LLM-rewritten `intent.query` is only valuable when we actually
+                // merged conversational context into it. Without context it tends to
+                // drop specifics (counts like "10", demographic hints like "city 1",
+                // the "%" sign, etc.) — which breaks downstream SQL generation. So:
+                //   - with context   → use the merged rewrite (intent.query)
+                //   - without context → use the user's original text verbatim
+                const searchQuery = (agentContext && intent.query)
+                    ? intent.query
+                    : (query || intent.query);
                 const result = await queryTrakr(searchQuery);
 
                 // If the backend needs platform disambiguation, store state + ask

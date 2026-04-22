@@ -80,7 +80,12 @@ Context:"beauty creators". User:"sort by followers" → {"action":"search","quer
  * @param {string|null} context - Optional conversation context (quoted bot reply, etc.)
  * @returns {Object} - { action, query, instagram_username, greeting_response }
  */
+// Hard timeout so a stuck LLM call can't freeze the user's message queue.
+const INTENT_TIMEOUT_MS = parseInt(process.env.INTENT_TIMEOUT_MS || '10000', 10);
+
 async function classifyIntent(userMessage, context = null) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), INTENT_TIMEOUT_MS);
     try {
         let userPrompt = userMessage;
         if (context) {
@@ -103,6 +108,7 @@ async function classifyIntent(userMessage, context = null) {
                 temperature: 0.0,
                 max_tokens: 256,
             }),
+            signal: controller.signal,
         });
 
         if (!response.ok) {
@@ -124,8 +130,14 @@ async function classifyIntent(userMessage, context = null) {
         return result;
 
     } catch (err) {
-        console.error('⚠️ Agent classify error:', err.message);
+        if (err.name === 'AbortError') {
+            console.warn(`⏱️ Agent classify timed out after ${INTENT_TIMEOUT_MS}ms — using rule-based fallback`);
+        } else {
+            console.error('⚠️ Agent classify error:', err.message);
+        }
         return fallbackClassify(userMessage);
+    } finally {
+        clearTimeout(timer);
     }
 }
 
