@@ -38,6 +38,14 @@ win-venv/
 client_secrets.json
 service_account.json
 
+# Secrets / deployment notes (contains Supabase service key, NVIDIA keys,
+# APIFY token, JWT secret, Google SA — NEVER commit)
+RENDER_ENV_VARS.txt
+
+# Local-only tools / artifacts
+supabase.exe
+server.log
+
 # Frontend is a separate repo (finnet-frontend) — never commit to backend
 frontend/
 _frontend_deploy/
