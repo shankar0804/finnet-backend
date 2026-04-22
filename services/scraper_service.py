@@ -216,10 +216,12 @@ def _run_apify_actor(actor_id: str, run_input: dict) -> list:
     run_id = run_data.get("id")
     dataset_id = run_data.get("defaultDatasetId")
 
-    # Poll for completion
+    # Poll for completion. 2s interval is a good balance: short enough that
+    # we pick up completion quickly (saves ~2s per actor run vs 3s), but
+    # long enough that we don't hammer Apify's API.
     status_url = f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
     while True:
-        time.sleep(3)
+        time.sleep(2)
         status_resp = requests.get(status_url, verify=False)
         status = status_resp.json().get("data", {}).get("status")
         if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):

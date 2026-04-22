@@ -10,6 +10,7 @@ This gives us proper engagement rate calculation (likes+comments / views).
 import os
 import re
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from services.scraper_service import (
     _run_apify_actor,
@@ -144,7 +145,10 @@ def fetch_youtube_data(channel_input: str) -> dict:
     channel_url = f"https://www.youtube.com/@{handle}"
     logger.info(f"[YouTube] Starting scrape for: {channel_url} (handle: {handle})")
 
-    # ─── Step 1: Fetch long-form videos via streamers/youtube-scraper ───
+    # ─── Step 1+2: Fetch long-form AND shorts IN PARALLEL ───
+    # Both actors are I/O-bound (waiting on Apify's servers), so running them
+    # concurrently cuts total wall time from (long + shorts) to max(long, shorts).
+    # This is the key fix for the Gunicorn 120s worker timeout.
     long_input = {
         "startUrls": [{"url": channel_url}],
         "maxResults": 15,
@@ -152,24 +156,29 @@ def fetch_youtube_data(channel_input: str) -> dict:
         "maxResultStreams": 0,
         "sortVideosBy": "NEWEST",
     }
-
-    logger.info("[YouTube] Fetching long-form videos...")
-    long_items = _run_apify_actor("streamers/youtube-scraper", long_input)
-    logger.info(f"[YouTube] Long-form: got {len(long_items)} items")
-
-    # ─── Step 2: Fetch shorts via streamers/youtube-shorts-scraper ───
     shorts_input = {
         "channels": [handle],
         "maxResultsShorts": 15,
     }
 
-    logger.info("[YouTube] Fetching Shorts...")
-    try:
-        short_items = _run_apify_actor("streamers/youtube-shorts-scraper", shorts_input)
-        logger.info(f"[YouTube] Shorts: got {len(short_items)} items")
-    except Exception as e:
-        logger.warning(f"[YouTube] Shorts scraper failed (channel may have none): {e}")
-        short_items = []
+    logger.info("[YouTube] Fetching long-form + Shorts in parallel...")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        long_future = pool.submit(_run_apify_actor, "streamers/youtube-scraper", long_input)
+        short_future = pool.submit(_run_apify_actor, "streamers/youtube-shorts-scraper", shorts_input)
+
+        try:
+            long_items = long_future.result()
+            logger.info(f"[YouTube] Long-form: got {len(long_items)} items")
+        except Exception as e:
+            logger.warning(f"[YouTube] Long-form scraper failed: {e}")
+            long_items = []
+
+        try:
+            short_items = short_future.result()
+            logger.info(f"[YouTube] Shorts: got {len(short_items)} items")
+        except Exception as e:
+            logger.warning(f"[YouTube] Shorts scraper failed (channel may have none): {e}")
+            short_items = []
 
     if not long_items and not short_items:
         raise ValueError(f"No data found for YouTube channel: {channel_input}")
